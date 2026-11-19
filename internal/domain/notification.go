@@ -145,3 +145,12 @@ func NewNotification(in CreateInput, correlationID string, now time.Time) Notifi
 		UpdatedAt:      now,
 	}
 }
+
+// Attempt records one delivery attempt for auditing and debugging.
+type Attempt struct {
+	NotificationID uuid.UUID
+	Attempt        int
+	HTTPStatus     int // 0 when no response was received
+	Error          *string
+	LatencyMS      int64
+}
