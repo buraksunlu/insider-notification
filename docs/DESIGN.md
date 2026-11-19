@@ -78,10 +78,10 @@ One path therefore covers: crash-safe enqueue (transactional outbox), **schedule
 | id uuid PK | also sent to provider as idempotency key |
 | batch_id uuid NULL FK | |
 | idempotency_key text NULL, UNIQUE | client-supplied |
-| channel enum(sms, email, push) | |
+| channel text CHECK (sms, email, push) | |
 | recipient text, content text | |
-| priority enum(high, normal, low) | |
-| status enum(pending, queued, processing, sent, failed, cancelled) | |
+| priority text CHECK (high, normal, low) + generated `priority_rank` smallint | rank lets the relay sort without CASE |
+| status text CHECK (pending, queued, processing, sent, failed, cancelled) | |
 | attempts int, max_attempts int (default 8) | |
 | next_attempt_at timestamptz | due time (scheduling + retry) |
 | scheduled_at timestamptz NULL | as requested by client |
@@ -89,7 +89,11 @@ One path therefore covers: crash-safe enqueue (transactional outbox), **schedule
 | correlation_id text | |
 | created_at, updated_at, sent_at | |
 
-Indexes: `(status, next_attempt_at)` for the relay; `(created_at, id)` for keyset listing;
+Enumerations are `text` + `CHECK` rather than Postgres `ENUM` types, so adding a value later is a
+plain migration (`ALTER TYPE … ADD VALUE` cannot run inside a transaction on older versions).
+
+Indexes: partial `(next_attempt_at) WHERE status='pending'` for the relay; partial
+`(updated_at) WHERE status='processing'` for the sweeper; `(created_at, id)` for keyset listing;
 `(batch_id)`; `(channel, status, created_at)` for filters.
 
 `batches` (id, total, created_at) · `delivery_attempts` (notification_id, attempt, http_status,
@@ -140,8 +144,8 @@ Graceful shutdown: stop consuming, finish in-flight, close channels (context + `
 ## 7. API (chi, `/api/v1`, JSON, OpenAPI 3 in `api/openapi.yaml`)
 | Method & path | Behaviour |
 |---|---|
-| `POST /notifications` | Create one. Optional `idempotency_key`, `scheduled_at`, `template_id`+`variables`. 201; replay of the same key → 200 with the existing row. |
-| `POST /notifications/batch` | 1–1000 items. Validate all first; any invalid → 422 with per-index errors, nothing stored. Otherwise single transaction → 201 `{batch_id, ids}`. |
+| `POST /notifications` | Create one. Optional `idempotency_key`, `scheduled_at`, `template_id`+`variables`. 201; replay of the same key with the same payload → 200 with the existing row; same key with a different payload (channel, recipient, content, priority, scheduled_at) → 409. |
+| `POST /notifications/batch` | 1–1000 items. Validate all first; any invalid or a key repeated inside the batch → 422 with per-index errors, nothing stored. Otherwise single transaction → 201 `{batch_id, ids}`. An item whose key already exists reuses that row's id (it stays linked to its original batch, and the batch `total` counts new rows only); a key reused with a different payload → 409 for the whole batch. |
 | `GET /notifications/{id}` | Status + attempts. |
 | `GET /batches/{id}` | Counts per status + paginated items. |
 | `POST /notifications/{id}/cancel` | Only `pending`/`queued` → 200; otherwise 409. |
