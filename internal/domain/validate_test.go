@@ -82,8 +82,8 @@ func TestNewNotification_Defaults(t *testing.T) {
 	if n.Priority != PriorityNormal {
 		t.Errorf("Priority = %q, want normal", n.Priority)
 	}
-	if n.MaxAttempts != 5 {
-		t.Errorf("MaxAttempts = %d, want 5", n.MaxAttempts)
+	if n.MaxAttempts != 8 {
+		t.Errorf("MaxAttempts = %d, want 8", n.MaxAttempts)
 	}
 	if !n.NextAttemptAt.Equal(now) {
 		t.Errorf("NextAttemptAt = %v, want now", n.NextAttemptAt)

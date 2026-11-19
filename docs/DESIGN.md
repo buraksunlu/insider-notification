@@ -82,7 +82,7 @@ One path therefore covers: crash-safe enqueue (transactional outbox), **schedule
 | recipient text, content text | |
 | priority enum(high, normal, low) | |
 | status enum(pending, queued, processing, sent, failed, cancelled) | |
-| attempts int, max_attempts int (default 5) | |
+| attempts int, max_attempts int (default 8) | |
 | next_attempt_at timestamptz | due time (scheduling + retry) |
 | scheduled_at timestamptz NULL | as requested by client |
 | provider_message_id text NULL, last_error text NULL | |
@@ -121,10 +121,12 @@ pending | queued ──cancel──▶ cancelled
    headers `Idempotency-Key: <id>`, `X-Correlation-ID`.
 4. **Classify**:
    - 2xx → `sent`, store `messageId`.
-   - 429, 5xx, timeout, network error → retryable.
-   - other 4xx → permanent.
+   - 408, 429, 5xx, timeout, network error, cancellation on shutdown → retryable.
+   - other 4xx and leftover 3xx (redirects are already followed by the client) → permanent.
 5. Retryable and `attempts < max_attempts` → `pending`, `next_attempt_at = now + full-jitter
-   backoff` (base 2 s, ×2 per attempt, cap 5 min; honour `Retry-After` on 429).
+   backoff` (base 2 s, ×2 per attempt, cap 5 min; honour `Retry-After` on 429, capped at 5 min).
+   With 8 attempts the worst-case retry window is ≈ 4 min (2+4+…+128 s), long enough to ride
+   out a short provider outage; 5 attempts would give up after ≈ 30 s.
    Otherwise → `failed` + publish to DLQ.
 6. Write a `delivery_attempts` row, then **ack**.
 
