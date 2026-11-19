@@ -83,7 +83,7 @@ func (s Status) Valid() bool {
 }
 
 // DefaultMaxAttempts is how many delivery attempts a notification gets.
-const DefaultMaxAttempts = 5
+const DefaultMaxAttempts = 8
 
 // Notification is a single message to deliver to one recipient.
 type Notification struct {
