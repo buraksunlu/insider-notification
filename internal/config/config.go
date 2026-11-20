@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -18,6 +19,10 @@ type Config struct {
 	LogLevel    string
 	// RetryBase is the base delay of the exponential retry backoff.
 	RetryBase time.Duration
+	// WorkerPrefetch is how many messages per channel a worker delivers
+	// concurrently. It must cover rate × provider latency (100/s × 200 ms
+	// = 20) so the rate limiter, not concurrency, caps throughput.
+	WorkerPrefetch int
 }
 
 // Load reads the configuration from the environment, applying defaults
@@ -48,6 +53,12 @@ func Load() (Config, error) {
 		errs = append(errs, fmt.Errorf("RETRY_BASE must be a positive duration"))
 	}
 	cfg.RetryBase = base
+
+	prefetch, err := strconv.Atoi(getenv("WORKER_PREFETCH", "50"))
+	if err != nil || prefetch < 1 {
+		errs = append(errs, fmt.Errorf("WORKER_PREFETCH must be a positive integer"))
+	}
+	cfg.WorkerPrefetch = prefetch
 
 	return cfg, errors.Join(errs...)
 }
