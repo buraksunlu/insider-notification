@@ -39,6 +39,9 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.RetryBase != 2*time.Second {
 		t.Errorf("RetryBase = %v, want 2s", cfg.RetryBase)
 	}
+	if cfg.WorkerPrefetch != 50 {
+		t.Errorf("WorkerPrefetch = %d, want 50", cfg.WorkerPrefetch)
+	}
 	if cfg.LogLevel != "info" {
 		t.Errorf("LogLevel = %q, want info", cfg.LogLevel)
 	}
@@ -50,5 +53,21 @@ func TestLoad_InvalidRetryBase(t *testing.T) {
 
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "RETRY_BASE") {
 		t.Fatalf("expected error mentioning RETRY_BASE, got %v", err)
+	}
+}
+
+func TestLoad_WorkerPrefetch(t *testing.T) {
+	setRequired(t)
+	t.Setenv("WORKER_PREFETCH", "25")
+	cfg, err := Load()
+	if err != nil || cfg.WorkerPrefetch != 25 {
+		t.Fatalf("WorkerPrefetch = %d (err %v), want 25", cfg.WorkerPrefetch, err)
+	}
+
+	for _, bad := range []string{"0", "-1", "many"} {
+		t.Setenv("WORKER_PREFETCH", bad)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "WORKER_PREFETCH") {
+			t.Errorf("WORKER_PREFETCH=%q: expected error, got %v", bad, err)
+		}
 	}
 }
