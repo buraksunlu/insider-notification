@@ -48,6 +48,7 @@ type Handler struct {
 	Sender   Sender
 	DLQ      DLQPublisher
 	Limiters map[domain.Channel]*rate.Limiter
+	Metrics  *observability.Metrics // nil disables metrics
 	Logger   *slog.Logger
 	Now      func() time.Time
 	Rand     func() float64
@@ -85,6 +86,7 @@ func (h *Handler) Handle(ctx context.Context, m queue.Message) error {
 	log := h.Logger.With("notification_id", m.ID.String(), "channel", string(m.Channel))
 	if !ok {
 		log.DebugContext(ctx, "skip message: notification is not queued")
+		h.Metrics.Delivery(m.Channel, observability.ResultSkipped)
 		return nil
 	}
 	log = log.With("attempt", n.Attempts)
@@ -98,13 +100,23 @@ func (h *Handler) Handle(ctx context.Context, m queue.Message) error {
 			log.WarnContext(ctx, "provider accepted without a message id", "status", res.StatusCode)
 		}
 		log.InfoContext(ctx, "notification sent", "status", res.StatusCode, "latency_ms", res.Latency.Milliseconds())
-		return h.write(ctx, log, func() error { return h.Store.MarkSent(ctx, n.ID, res.MessageID, h.Now()) })
+		now := h.Now()
+		if err := h.write(ctx, log, func() error { return h.Store.MarkSent(ctx, n.ID, res.MessageID, now) }); err != nil {
+			return err
+		}
+		h.Metrics.Delivery(n.Channel, observability.ResultSent)
+		h.Metrics.EndToEnd(n.Channel, now.Sub(dueAt(n)))
+		return nil
 
 	case outcome == OutcomeRetry && n.Attempts < n.MaxAttempts:
 		reason := failureReason(res, sendErr)
 		delay := NextDelay(n.Attempts, h.RetryBase, res.RetryAfter, h.Rand)
 		log.WarnContext(ctx, "delivery failed, retry scheduled", "reason", reason, "retry_in", delay.String())
-		return h.write(ctx, log, func() error { return h.Store.ScheduleRetry(ctx, n.ID, h.Now().Add(delay), reason) })
+		if err := h.write(ctx, log, func() error { return h.Store.ScheduleRetry(ctx, n.ID, h.Now().Add(delay), reason) }); err != nil {
+			return err
+		}
+		h.Metrics.Delivery(n.Channel, observability.ResultRetry)
+		return nil
 
 	default:
 		reason := failureReason(res, sendErr)
@@ -117,6 +129,7 @@ func (h *Handler) Handle(ctx context.Context, m queue.Message) error {
 		if err := h.write(ctx, log, func() error { return h.Store.MarkFailed(ctx, n.ID, reason) }); err != nil {
 			return err
 		}
+		h.Metrics.Delivery(n.Channel, observability.ResultFailed)
 		n.Status, n.LastError = domain.StatusFailed, &reason
 		if err := h.DLQ.PublishDLQ(ctx, n, reason); err != nil {
 			log.ErrorContext(ctx, "publish to DLQ failed", "error", err)
@@ -131,9 +144,24 @@ func (h *Handler) deliver(ctx context.Context, n domain.Notification, corr strin
 			return provider.Result{}, fmt.Errorf("rate limiter: %w", err)
 		}
 	}
-	return h.Sender.Send(ctx, n.ID.String(), corr, provider.Request{
+	// Timed here rather than taken from Result.Latency so timeouts and
+	// network errors are observed too.
+	start := time.Now()
+	res, err := h.Sender.Send(ctx, n.ID.String(), corr, provider.Request{
 		To: n.Recipient, Channel: string(n.Channel), Content: n.Content,
 	})
+	h.Metrics.AttemptDuration(n.Channel, time.Since(start))
+	return res, err
+}
+
+// dueAt is when a notification became deliverable: its scheduled time, or
+// its creation for immediate ones. End-to-end latency is measured from here
+// so a notification scheduled days ahead does not look days late.
+func dueAt(n domain.Notification) time.Time {
+	if n.ScheduledAt != nil && n.ScheduledAt.After(n.CreatedAt) {
+		return *n.ScheduledAt
+	}
+	return n.CreatedAt
 }
 
 // recordAttempt writes the audit row. It is best effort: losing an audit
