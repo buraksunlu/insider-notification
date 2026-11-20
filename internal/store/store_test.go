@@ -447,3 +447,38 @@ func TestCancelBatch_CancelsOnlyPendingAndQueued(t *testing.T) {
 		t.Fatalf("unknown batch: want ErrNotFound, got %v", err)
 	}
 }
+
+func TestListenSignalsOnInsert(t *testing.T) {
+	s, _ := setup(t)
+	lctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	wake := s.Listen(lctx, "new_notification")
+
+	// The first signal fires once LISTEN is active, covering anything
+	// inserted before the subscription existed.
+	select {
+	case <-wake:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no signal after LISTEN became active")
+	}
+
+	mustCreate(t, s, newSMS("listen"))
+	select {
+	case <-wake:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no signal after insert")
+	}
+
+	cancel()
+	select {
+	case _, ok := <-wake:
+		if ok {
+			// A buffered signal may still be pending; the next read must close.
+			if _, ok := <-wake; ok {
+				t.Fatal("channel not closed after cancel")
+			}
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("channel not closed after cancel")
+	}
+}
