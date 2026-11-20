@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/buraksunlu/insider-notification/internal/domain"
+	"github.com/buraksunlu/insider-notification/internal/observability"
 	"github.com/buraksunlu/insider-notification/internal/store"
 )
 
@@ -32,6 +33,10 @@ type Deps struct {
 	Ready  func(context.Context) error
 	Logger *slog.Logger
 	Now    func() time.Time
+	// Metrics records API metrics; nil disables them.
+	Metrics *observability.Metrics
+	// MetricsHandler, when set, is served at /metrics.
+	MetricsHandler http.Handler
 }
 
 // MaxBodyBytes bounds request bodies: 1000 emails of 10 000 multibyte
@@ -39,10 +44,11 @@ type Deps struct {
 const MaxBodyBytes = 16 << 20
 
 type server struct {
-	store NotificationStore
-	ready func(context.Context) error
-	log   *slog.Logger
-	now   func() time.Time
+	store   NotificationStore
+	ready   func(context.Context) error
+	log     *slog.Logger
+	now     func() time.Time
+	metrics *observability.Metrics
 }
 
 // NewRouter builds the HTTP handler with all routes and middleware.
@@ -50,7 +56,7 @@ func NewRouter(d Deps) http.Handler {
 	if d.Now == nil {
 		d.Now = time.Now
 	}
-	s := &server{store: d.Store, ready: d.Ready, log: d.Logger, now: d.Now}
+	s := &server{store: d.Store, ready: d.Ready, log: d.Logger, now: d.Now, metrics: d.Metrics}
 
 	r := chi.NewRouter()
 	r.Use(correlationID, s.requestLog, s.recoverer, limitBody(MaxBodyBytes))
@@ -63,6 +69,9 @@ func NewRouter(d Deps) http.Handler {
 
 	r.Get("/healthz", s.healthz)
 	r.Get("/readyz", s.readyz)
+	if d.MetricsHandler != nil {
+		r.Method(http.MethodGet, "/metrics", d.MetricsHandler)
+	}
 
 	r.Route("/api/v1", func(r chi.Router) {
 		r.Post("/notifications", s.createNotification)

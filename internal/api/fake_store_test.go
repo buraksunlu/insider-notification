@@ -57,6 +57,14 @@ func (f *fakeStore) CreateBatch(_ context.Context, ns []domain.Notification) (uu
 	id := uuid.New()
 	ids := make([]uuid.UUID, len(ns))
 	for i, n := range ns {
+		// Like the real store, an existing idempotency key reuses that row.
+		if n.IdempotencyKey != nil {
+			if existing, ok := f.byKey[*n.IdempotencyKey]; ok {
+				ids[i] = existing
+				continue
+			}
+			f.byKey[*n.IdempotencyKey] = n.ID
+		}
 		n.BatchID = &id
 		f.byID[n.ID] = n
 		ids[i] = n.ID

@@ -54,6 +54,7 @@ func (s *server) createNotification(w http.ResponseWriter, r *http.Request) {
 	}
 	status := http.StatusOK // idempotent replay
 	if created {
+		s.metrics.Created(got.Channel)
 		status = http.StatusAccepted
 		w.Header().Set("Location", "/api/v1/notifications/"+got.ID.String())
 	}
@@ -110,6 +111,11 @@ func (s *server) createBatch(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		s.storeError(w, r, err)
 		return
+	}
+	for i, id := range ids {
+		if id == ns[i].ID { // otherwise an existing row was reused by idempotency key
+			s.metrics.Created(ns[i].Channel)
+		}
 	}
 	w.Header().Set("Location", "/api/v1/batches/"+batchID.String())
 	writeJSON(w, http.StatusAccepted, batchCreatedResponse{BatchID: batchID, IDs: ids})

@@ -8,6 +8,7 @@ import (
 	"runtime/debug"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
 
@@ -38,15 +39,32 @@ func (s *server) requestLog(next http.Handler) http.Handler {
 		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
 		next.ServeHTTP(ww, r)
 
-		level := s.logLevelFor(r.URL.Path, ww.Status())
+		status := ww.Status()
+		if status == 0 {
+			status = http.StatusOK // handler wrote nothing
+		}
+		s.metrics.HTTPRequest(r.Method, routePattern(r), status, time.Since(start))
+
+		level := s.logLevelFor(r.URL.Path, status)
 		s.log.Log(r.Context(), level, "http request",
 			"method", r.Method,
 			"path", r.URL.Path,
-			"status", ww.Status(),
+			"status", status,
 			"bytes", ww.BytesWritten(),
 			"duration_ms", time.Since(start).Milliseconds(),
 		)
 	})
+}
+
+// routePattern is the matched chi pattern (e.g. /api/v1/notifications/{id}),
+// read after routing; raw paths would give every id its own time series.
+func routePattern(r *http.Request) string {
+	if rc := chi.RouteContext(r.Context()); rc != nil {
+		if p := rc.RoutePattern(); p != "" {
+			return p
+		}
+	}
+	return "unmatched"
 }
 
 func (s *server) logLevelFor(path string, status int) slog.Level {
