@@ -426,3 +426,24 @@ func assertCount(t *testing.T, pool *pgxpool.Pool, table string, want int) {
 		t.Fatalf("%s rows = %d, want %d", table, got, want)
 	}
 }
+
+func TestCancelBatch_CancelsOnlyPendingAndQueued(t *testing.T) {
+	s, pool := setup(t)
+	batchID, ids, err := s.CreateBatch(ctx, []domain.Notification{newSMS("1"), newSMS("2"), newSMS("3")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	setStatus(t, pool, ids[1], domain.StatusQueued)
+	setStatus(t, pool, ids[2], domain.StatusSent)
+
+	n, err := s.CancelBatch(ctx, batchID)
+	if err != nil || n != 2 {
+		t.Fatalf("cancel batch: n=%d err=%v, want 2", n, err)
+	}
+	if got, _ := s.Get(ctx, ids[2]); got.Status != domain.StatusSent {
+		t.Fatalf("sent item status = %s, want sent", got.Status)
+	}
+	if _, err := s.CancelBatch(ctx, uuid.New()); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("unknown batch: want ErrNotFound, got %v", err)
+	}
+}
