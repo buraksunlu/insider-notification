@@ -294,3 +294,56 @@ func TestPublishDLQ(t *testing.T) {
 		t.Fatalf("dlq body = %+v", body)
 	}
 }
+
+func TestDepthReaderReportsAllQueues(t *testing.T) {
+	conn, ch := setup(t)
+	p := publisher(t, conn)
+	for range 2 {
+		if err := p.Publish(context.Background(), notification(domain.ChannelSMS, domain.PriorityNormal)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitDepth(t, ch, queue.Name(domain.ChannelSMS), 2)
+
+	r := queue.NewDepthReader(conn)
+	t.Cleanup(r.Close)
+	got, err := r.Depths(context.Background())
+	if err != nil {
+		t.Fatalf("Depths: %v", err)
+	}
+	want := map[string]int{
+		"notifications.sms": 2, "notifications.email": 0, "notifications.push": 0, "notifications.dlq": 0,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("Depths = %v, want %v", got, want)
+	}
+	for q, n := range want {
+		if got[q] != n {
+			t.Errorf("depth %s = %d, want %d", q, got[q], n)
+		}
+	}
+}
+
+func TestDepthReaderRecoversClosedChannel(t *testing.T) {
+	conn, ch := setup(t)
+	r := queue.NewDepthReader(conn)
+	t.Cleanup(r.Close)
+	if _, err := r.Depths(context.Background()); err != nil {
+		t.Fatalf("Depths: %v", err)
+	}
+
+	// A passive declare of a missing queue makes the broker close the channel.
+	if _, err := ch.QueueDelete(queue.Name(domain.ChannelPush), false, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Depths(context.Background()); err == nil {
+		t.Fatal("Depths with a missing queue: want error")
+	}
+
+	if err := queue.Setup(ch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Depths(context.Background()); err != nil {
+		t.Fatalf("Depths after the queue is back: %v (channel not reopened)", err)
+	}
+}
