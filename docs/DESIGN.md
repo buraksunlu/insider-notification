@@ -144,19 +144,23 @@ Graceful shutdown: stop consuming, finish in-flight, close channels (context + `
 ## 7. API (chi, `/api/v1`, JSON, OpenAPI 3 in `api/openapi.yaml`)
 | Method & path | Behaviour |
 |---|---|
-| `POST /notifications` | Create one. Optional `idempotency_key`, `scheduled_at`, `template_id`+`variables`. 201; replay of the same key with the same payload → 200 with the existing row; same key with a different payload (channel, recipient, content, priority, scheduled_at) → 409. |
-| `POST /notifications/batch` | 1–1000 items. Validate all first; any invalid or a key repeated inside the batch → 422 with per-index errors, nothing stored. Otherwise single transaction → 201 `{batch_id, ids}`. An item whose key already exists reuses that row's id (it stays linked to its original batch, and the batch `total` counts new rows only); a key reused with a different payload → 409 for the whole batch. |
+| `POST /notifications` | Create one. Optional `Idempotency-Key` header (≤ 255 chars), `scheduled_at`, `template_id`+`variables`. **202 Accepted** + `Location` (delivery is asynchronous); replay of the same key with the same payload → 200 with the existing row; same key with a different payload (channel, recipient, content, priority, scheduled_at) → 409. |
+| `POST /notifications/batch` | 1–1000 items. Validate all first; any invalid or a key repeated inside the batch → 422 with per-index errors, nothing stored. Each item may carry its own `idempotency_key` body field. Otherwise single transaction → 202 `{batch_id, ids}` + `Location`. An item whose key already exists reuses that row's id (it stays linked to its original batch, and the batch `total` counts new rows only); a key reused with a different payload → 409 for the whole batch. |
 | `GET /notifications/{id}` | Status + attempts. |
 | `GET /batches/{id}` | Counts per status + paginated items. |
-| `POST /notifications/{id}/cancel` | Only `pending`/`queued` → 200; otherwise 409. |
-| `GET /notifications` | Filters `status, channel, from, to`; keyset pagination `limit` (≤100) + opaque `cursor`. |
+| `POST /notifications/{id}/cancel` | Only `pending`/`queued` → 200; otherwise 409. `POST`, not `DELETE`: the record is kept. |
+| `POST /batches/{id}/cancel` | Cancels every `pending`/`queued` item of the batch → 200 `{batch_id, cancelled}`; unknown batch → 404. |
+| `GET /notifications` | Filters `status, channel, from, to` (RFC 3339, inclusive); keyset pagination `limit` (1–100, default 20) + opaque `cursor`. Response `{data: [...], next_cursor}`; bad parameters → 400. |
 | `POST /templates`, `GET /templates/{id}` | Bonus. |
 | `GET /healthz` | Liveness. |
 | `GET /readyz` | DB + RabbitMQ reachable. |
 | `GET /metrics` | Prometheus. |
 | `GET /docs` | Swagger UI over the spec. |
 
-Errors: one JSON shape `{error: {code, message, details}}`.
+Errors: one JSON shape `{error: {code, message, details}}`. Malformed JSON → 400, body
+validation (incl. unknown fields, so typos are not silently ignored) → 422, bad query parameters → 400,
+body over 16 MB → 413 (1000 emails × 10 000 multibyte chars must fit). Single resources are returned
+unwrapped; JSON fields are `snake_case`. Unknown errors are logged and answered with a generic 500.
 
 ### Validation (my calls)
 - sms: recipient E.164 (`^\+[1-9]\d{7,14}$`), content ≤ 160 chars (runes).
