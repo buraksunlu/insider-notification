@@ -61,7 +61,8 @@ The API never publishes to RabbitMQ directly. It only inserts rows (`status=pend
 transaction and fires `NOTIFY`. The worker's **relay** loop claims due rows
 (`status='pending' AND next_attempt_at <= now()`, `FOR UPDATE SKIP LOCKED`, batch of 500),
 publishes them with publisher confirms, then marks them `queued`.
-Woken by `LISTEN/NOTIFY`, with a 1 s polling fallback.
+Woken by `LISTEN/NOTIFY`, with a 1 s polling fallback. A full batch is followed immediately by
+the next one. The LISTEN connection reconnects after 1 s on loss; polling covers the gap.
 
 One path therefore covers: crash-safe enqueue (transactional outbox), **scheduled notifications**
 (`next_attempt_at = scheduled_at`), and **retry with backoff** (`next_attempt_at = now + backoff`).
@@ -114,7 +115,10 @@ pending | queued ──cancel──▶ cancelled
   `x-max-priority=3` (high=3, normal=2, low=1), dead-letter exchange `notifications.dlx`.
 - `notifications.dlq` bound to the DLX: receives permanently failed notifications
   (published explicitly) and poison messages (`nack requeue=false`).
-- Consumers: per-channel, prefetch small (≈ 10) so priority actually reorders a backlog.
+- Consumers: per-channel, prefetch `WORKER_PREFETCH` (default 50), handled concurrently.
+  Prefetch must cover rate × provider latency (100/s × ~200 ms ≈ 20 in flight) or concurrency,
+  not the rate limiter, caps throughput. The trade-off: up to 50 messages already handed to a
+  consumer are not reordered by priority, which is small next to a backlog of thousands.
 
 ## 6. Processing (consumer)
 1. **Claim guard**: `UPDATE notifications SET status='processing', attempts=attempts+1
@@ -131,8 +135,15 @@ pending | queued ──cancel──▶ cancelled
    backoff` (base 2 s, ×2 per attempt, cap 5 min; honour `Retry-After` on 429, capped at 5 min).
    With 8 attempts the worst-case retry window is ≈ 4 min (2+4+…+128 s), long enough to ride
    out a short provider outage; 5 attempts would give up after ≈ 30 s.
-   Otherwise → `failed` + publish to DLQ.
-6. Write a `delivery_attempts` row, then **ack**.
+   Otherwise → `failed` first, then publish to DLQ: the database is the source of truth, so a
+   DLQ publish failure is only logged and the row still reads `failed` through the API.
+6. Write a `delivery_attempts` row (best effort: an audit failure is logged and does not change
+   the outcome), then **ack**.
+
+The final state write (`sent` / retry / `failed`) is retried 3 times (100, 200 ms pauses) before
+the message is requeued, so a short database blip does not turn a delivered message into a
+duplicate send after the sweeper resets it. `ErrStateConflict` (row already moved on) is not
+retried. The rate limiter runs after the claim guard, so skipped messages spend no tokens.
 
 Crash recovery: an unacked message is redelivered, but its row is `processing`, so the guard
 would skip it. The **sweeper** resets rows stuck in `processing` for > 2 min back to `pending`.
