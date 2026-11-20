@@ -150,6 +150,21 @@ func (s *Store) Cancel(ctx context.Context, id uuid.UUID) (domain.Notification, 
 	return domain.Notification{}, ErrNotCancellable
 }
 
+// CancelBatch cancels every pending or queued notification of a batch and
+// returns how many were cancelled.
+func (s *Store) CancelBatch(ctx context.Context, batchID uuid.UUID) (int64, error) {
+	var exists bool
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM batches WHERE id = $1)`, batchID).Scan(&exists); err != nil {
+		return 0, err
+	}
+	if !exists {
+		return 0, ErrNotFound
+	}
+	tag, err := s.pool.Exec(ctx, `UPDATE notifications SET status = 'cancelled', updated_at = now()
+		WHERE batch_id = $1 AND status IN ('pending', 'queued')`, batchID)
+	return tag.RowsAffected(), err
+}
+
 // BatchSummary describes a batch and how its notifications are progressing.
 type BatchSummary struct {
 	ID        uuid.UUID
