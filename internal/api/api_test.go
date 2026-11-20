@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/buraksunlu/insider-notification/internal/api"
 	"github.com/buraksunlu/insider-notification/internal/domain"
@@ -27,16 +28,19 @@ type harness struct {
 	store   *fakeStore
 	handler http.Handler
 	ready   error
+	reg     *prometheus.Registry
 }
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	h := &harness{store: newFakeStore()}
+	h := &harness{store: newFakeStore(), reg: prometheus.NewRegistry()}
 	h.handler = api.NewRouter(api.Deps{
-		Store:  h.store,
-		Ready:  func(context.Context) error { return h.ready },
-		Logger: observability.NewLogger(io.Discard, "error"),
-		Now:    func() time.Time { return fixedNow },
+		Store:          h.store,
+		Ready:          func(context.Context) error { return h.ready },
+		Logger:         observability.NewLogger(io.Discard, "error"),
+		Now:            func() time.Time { return fixedNow },
+		Metrics:        observability.NewMetrics(h.reg),
+		MetricsHandler: observability.MetricsHandler(h.reg),
 	})
 	return h
 }
