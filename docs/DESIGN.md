@@ -180,13 +180,20 @@ unwrapped; JSON fields are `snake_case`. Unknown errors are logged and answered 
 - content non-empty after trim; priority defaults to `normal`; `scheduled_at` must be in the future (≤ 30 days).
 
 ## 8. Observability
-- **Metrics** (Prometheus client):
-  - `notifications_created_total{channel}`
-  - `deliveries_total{channel,result=sent|retry|failed}`
-  - `delivery_attempt_duration_seconds{channel}` (provider latency)
-  - `notification_end_to_end_seconds{channel}` (created → sent)
-  - `queue_depth{queue}` (RabbitMQ passive declare, scraped every 5 s)
-  - `notifications_by_status{status}` (DB gauge)
+- **Metrics** (Prometheus client, own registry plus Go/process collectors):
+  - `notifications_created_total{channel}`: new rows only, idempotent replays excluded (api)
+  - `http_request_duration_seconds{method,route,code}`: `route` is the chi pattern
+    (`/api/v1/notifications/{id}`), never the raw path, so ids do not create series (api)
+  - `deliveries_total{channel,result=sent|retry|failed|skipped}`: `skipped` counts messages the
+    claim guard dropped (cancelled or duplicate); counted only after the state write succeeded (worker)
+  - `delivery_attempt_duration_seconds{channel}`: provider call, timeouts included (worker)
+  - `notification_end_to_end_seconds{channel}`: from when the notification became due
+    (`scheduled_at`, else `created_at`) to sent, retries included; buckets up to 10 min (worker)
+  - `queue_depth{queue}`: channel queues and the DLQ, RabbitMQ passive declare every 5 s (worker)
+  - `notifications_by_status{status}`: DB gauge every 5 s, absent statuses reported as 0 (worker)
+- The api serves `/metrics` on `HTTP_ADDR`, the worker on `METRICS_ADDR`. Only the worker runs
+  the gauge collector, so state gauges are never reported twice. Success/failure ratios are
+  PromQL over `deliveries_total` (examples in the README).
 - **Logging**: `log/slog` JSON. Middleware reads or generates `X-Correlation-ID`, echoes it,
   stores it on the row and in the AMQP header; the worker logs with the same ID.
 

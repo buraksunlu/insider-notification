@@ -11,8 +11,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/buraksunlu/insider-notification/internal/domain"
+	"github.com/buraksunlu/insider-notification/internal/observability"
 	"github.com/buraksunlu/insider-notification/internal/provider"
 	"github.com/buraksunlu/insider-notification/internal/queue"
 	"github.com/buraksunlu/insider-notification/internal/store"
@@ -476,5 +478,131 @@ func TestRateLimitChannelsAreIndependent(t *testing.T) {
 	wg.Wait()
 	if elapsed := time.Since(start); elapsed > 300*time.Millisecond {
 		t.Errorf("100 sms + 100 email took %v, channels block each other", elapsed)
+	}
+}
+
+// metricsRig is a rig whose handler records to a fresh registry.
+func metricsRig(t *testing.T) (*rig, *prometheus.Registry) {
+	t.Helper()
+	r := newRig(t)
+	reg := prometheus.NewRegistry()
+	r.h.Metrics = observability.NewMetrics(reg)
+	return r, reg
+}
+
+func deliveries(t *testing.T, reg *prometheus.Registry, result string) float64 {
+	t.Helper()
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() != "deliveries_total" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			labels := map[string]string{}
+			for _, lp := range m.GetLabel() {
+				labels[lp.GetName()] = lp.GetValue()
+			}
+			if labels["channel"] == "sms" && labels["result"] == result {
+				return m.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
+}
+
+func histogramCount(t *testing.T, reg *prometheus.Registry, name string) (uint64, float64) {
+	t.Helper()
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() == name && len(mf.GetMetric()) > 0 {
+			h := mf.GetMetric()[0].GetHistogram()
+			return h.GetSampleCount(), h.GetSampleSum()
+		}
+	}
+	return 0, 0
+}
+
+func TestHandleMetrics(t *testing.T) {
+	cases := []struct {
+		name    string
+		prepare func(r *rig)
+		result  string
+		sent    bool
+	}{
+		{"sent", func(*rig) {}, observability.ResultSent, true},
+		{"retry", func(r *rig) { r.send.res = provider.Result{StatusCode: 503} }, observability.ResultRetry, false},
+		{"failed", func(r *rig) { r.send.res = provider.Result{StatusCode: 400} }, observability.ResultFailed, false},
+		{"skipped", func(r *rig) { r.store.n.Status = domain.StatusCancelled }, observability.ResultSkipped, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, reg := metricsRig(t)
+			tc.prepare(r)
+			if err := r.h.Handle(context.Background(), r.msg()); err != nil {
+				t.Fatalf("Handle: %v", err)
+			}
+			for _, res := range []string{observability.ResultSent, observability.ResultRetry, observability.ResultFailed, observability.ResultSkipped} {
+				want := 0.0
+				if res == tc.result {
+					want = 1
+				}
+				if got := deliveries(t, reg, res); got != want {
+					t.Errorf("deliveries_total{result=%q} = %v, want %v", res, got, want)
+				}
+			}
+			attempts, _ := histogramCount(t, reg, "delivery_attempt_duration_seconds")
+			wantAttempts := uint64(1)
+			if tc.result == observability.ResultSkipped {
+				wantAttempts = 0 // nothing was sent
+			}
+			if attempts != wantAttempts {
+				t.Errorf("attempt duration samples = %d, want %d", attempts, wantAttempts)
+			}
+			e2e, _ := histogramCount(t, reg, "notification_end_to_end_seconds")
+			if tc.sent != (e2e == 1) {
+				t.Errorf("end-to-end samples = %d, want sent-only", e2e)
+			}
+		})
+	}
+}
+
+func TestHandleEndToEndStartsWhenDue(t *testing.T) {
+	r, reg := metricsRig(t)
+	// Created two days ago for a slot 30 s ago: latency is 30 s, not two days.
+	sched := fixedNow.Add(-30 * time.Second)
+	r.store.n.CreatedAt = fixedNow.Add(-48 * time.Hour)
+	r.store.n.ScheduledAt = &sched
+	if err := r.h.Handle(context.Background(), r.msg()); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if n, sum := histogramCount(t, reg, "notification_end_to_end_seconds"); n != 1 || sum != 30 {
+		t.Errorf("end-to-end = %d samples, sum %vs; want 1 sample of 30s", n, sum)
+	}
+
+	r2, reg2 := metricsRig(t)
+	r2.store.n.CreatedAt = fixedNow.Add(-5 * time.Second)
+	if err := r2.h.Handle(context.Background(), r2.msg()); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if n, sum := histogramCount(t, reg2, "notification_end_to_end_seconds"); n != 1 || sum != 5 {
+		t.Errorf("end-to-end = %d samples, sum %vs; want 1 sample of 5s", n, sum)
+	}
+}
+
+func TestHandleNoMetricWhenStateWriteFails(t *testing.T) {
+	r, reg := metricsRig(t)
+	boom := errors.New("db down")
+	r.store.markSentErrs = []error{boom, boom, boom}
+	if err := r.h.Handle(context.Background(), r.msg()); err == nil {
+		t.Fatal("Handle: want error")
+	}
+	if got := deliveries(t, reg, observability.ResultSent); got != 0 {
+		t.Errorf("sent counted although the row was not marked sent (requeued)")
 	}
 }
