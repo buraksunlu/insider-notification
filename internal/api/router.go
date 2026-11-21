@@ -38,6 +38,8 @@ type Deps struct {
 	Metrics *observability.Metrics
 	// MetricsHandler, when set, is served at /metrics.
 	MetricsHandler http.Handler
+	// OpenAPISpec, when set, is served at /openapi.yaml with Swagger UI at /docs.
+	OpenAPISpec []byte
 }
 
 // MaxBodyBytes bounds request bodies: 1000 emails of 10 000 multibyte
@@ -72,6 +74,10 @@ func NewRouter(d Deps) http.Handler {
 	r.Get("/readyz", s.readyz)
 	if d.MetricsHandler != nil {
 		r.Method(http.MethodGet, "/metrics", d.MetricsHandler)
+	}
+	if len(d.OpenAPISpec) > 0 {
+		r.Get("/openapi.yaml", serveSpec(d.OpenAPISpec))
+		r.Get("/docs", serveDocs)
 	}
 
 	r.Route("/api/v1", func(r chi.Router) {
