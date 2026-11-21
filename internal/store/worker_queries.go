@@ -12,8 +12,9 @@ import (
 	"github.com/buraksunlu/insider-notification/internal/domain"
 )
 
-// ClaimDue marks up to limit due pending notifications (highest priority
-// first) as queued, commits, and only then hands each to publish. The
+// ClaimDue marks up to limit due pending notifications of channel c
+// (highest priority first) as queued, commits, and only then hands each to
+// publish. The
 // commit must come first: a consumer can receive a message the moment it is
 // published, and it only claims rows that are already queued.
 //
@@ -21,17 +22,17 @@ import (
 // error is returned with the count published so far. A row whose release
 // also fails stays queued until the sweeper's stale-queued reset recovers it.
 // SKIP LOCKED lets several relays run without claiming the same rows.
-func (s *Store) ClaimDue(ctx context.Context, limit int, publish func(domain.Notification) error) (int, error) {
+func (s *Store) ClaimDue(ctx context.Context, c domain.Channel, limit int, publish func(domain.Notification) error) (int, error) {
 	var due []domain.Notification
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `UPDATE notifications SET status = 'queued', updated_at = now()
 			WHERE id IN (
 				SELECT id FROM notifications
-				WHERE status = 'pending' AND next_attempt_at <= now()
+				WHERE status = 'pending' AND next_attempt_at <= now() AND channel = $2
 				ORDER BY priority_rank DESC, next_attempt_at
 				LIMIT $1
 				FOR UPDATE SKIP LOCKED)
-			RETURNING `+columns, limit)
+			RETURNING `+columns, limit, c)
 		if err != nil {
 			return err
 		}
@@ -56,6 +57,27 @@ func (s *Store) ClaimDue(ctx context.Context, limit int, publish func(domain.Not
 		}
 	}
 	return len(due), nil
+}
+
+// QueuedByChannel counts notifications waiting in RabbitMQ (status queued)
+// per channel. The relay caps it, so the count stays small and is served by
+// the partial index on queued rows.
+func (s *Store) QueuedByChannel(ctx context.Context) (map[domain.Channel]int, error) {
+	rows, err := s.pool.Query(ctx, `SELECT channel, count(*) FROM notifications WHERE status = 'queued' GROUP BY channel`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[domain.Channel]int{}
+	for rows.Next() {
+		var c domain.Channel
+		var n int
+		if err := rows.Scan(&c, &n); err != nil {
+			return nil, err
+		}
+		out[c] = n
+	}
+	return out, rows.Err()
 }
 
 // release returns claimed but unpublished rows to pending. It is best
@@ -130,10 +152,16 @@ func (s *Store) RecordAttempt(ctx context.Context, a domain.Attempt) error {
 }
 
 // ResetStuck returns notifications stuck in processing for longer than
-// olderThan (e.g. their worker crashed) to pending so they are retried.
+// olderThan (e.g. their worker crashed) to pending so they are retried. A
+// row that was on its last attempt is marked failed instead, so attempts
+// never exceed max_attempts.
 func (s *Store) ResetStuck(ctx context.Context, olderThan time.Duration) (int64, error) {
 	tag, err := s.pool.Exec(ctx, `UPDATE notifications
-		SET status = 'pending', next_attempt_at = now(), updated_at = now()
+		SET status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'pending' END,
+		    last_error = CASE WHEN attempts >= max_attempts
+		                      THEN 'worker stopped during the last attempt; outcome unknown'
+		                      ELSE last_error END,
+		    next_attempt_at = now(), updated_at = now()
 		WHERE status = 'processing' AND updated_at < now() - make_interval(secs => $1)`, olderThan.Seconds())
 	return tag.RowsAffected(), err
 }

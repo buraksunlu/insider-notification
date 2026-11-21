@@ -19,29 +19,58 @@ import (
 
 var quiet = slog.New(slog.NewTextHandler(io.Discard, nil))
 
-// fakeOutbox hands out queued rows in chunks of at most limit.
+// fakeOutbox hands out due rows in chunks of at most limit and tracks how
+// many published rows per channel are still queued (not yet consumed).
 type fakeOutbox struct {
 	mu      sync.Mutex
 	due     []domain.Notification
+	queued  map[domain.Channel]int
 	failErr error
 	calls   int
 }
 
-func (f *fakeOutbox) ClaimDue(_ context.Context, limit int, publish func(domain.Notification) error) (int, error) {
+func (f *fakeOutbox) QueuedByChannel(context.Context) (map[domain.Channel]int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[domain.Channel]int{}
+	for c, n := range f.queued {
+		out[c] = n
+	}
+	return out, nil
+}
+
+func (f *fakeOutbox) ClaimDue(_ context.Context, c domain.Channel, limit int, publish func(domain.Notification) error) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
 	if f.failErr != nil {
 		return 0, f.failErr
 	}
-	n := min(limit, len(f.due))
-	for i := range n {
-		if err := publish(f.due[0]); err != nil {
-			return i, err // unpublished rows stay due, like the real release
-		}
-		f.due = f.due[1:]
+	if f.queued == nil {
+		f.queued = map[domain.Channel]int{}
 	}
-	return n, nil
+	claimed := 0
+	for i := 0; i < len(f.due) && claimed < limit; {
+		n := f.due[i]
+		if n.Channel != c {
+			i++
+			continue
+		}
+		if err := publish(n); err != nil {
+			return claimed, err // unpublished rows stay due, like the real release
+		}
+		f.due = append(f.due[:i], f.due[i+1:]...)
+		claimed++
+		f.queued[c]++
+	}
+	return claimed, nil
+}
+
+// consume simulates consumers taking n queued messages of channel c.
+func (f *fakeOutbox) consume(c domain.Channel, n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.queued[c] -= n
 }
 
 func (f *fakeOutbox) remaining() int {
@@ -168,6 +197,34 @@ func TestRelayKeepsRunningAfterErrors(t *testing.T) {
 	eventually(t, time.Second, func() bool { return pub.count() == 2 }, "relay stopped after a publish error")
 }
 
+// The relay keeps at most MaxQueued messages per channel in RabbitMQ, so
+// during a backlog no message waits long enough for the sweeper to take it
+// for lost and publish it again.
+func TestRelayCapsQueuedPerChannel(t *testing.T) {
+	outbox := &fakeOutbox{due: append(rows(50), pushRows(5)...)}
+	pub := &fakePublisher{}
+	r := &Relay{Store: outbox, Publisher: pub, Interval: 20 * time.Millisecond, Batch: 8, MaxQueued: 20, Logger: quiet}
+	runInBackground(t, r.Run)
+
+	eventually(t, time.Second, func() bool { return pub.count() == 25 }, "want 20 sms (the cap) and all 5 push published")
+	time.Sleep(60 * time.Millisecond) // several ticks: still capped
+	if got := pub.count(); got != 25 {
+		t.Fatalf("published %d with sms at its cap, want 25", got)
+	}
+
+	outbox.consume(domain.ChannelSMS, 15)
+	eventually(t, time.Second, func() bool { return pub.count() == 40 }, "relay did not refill sms after consumers made room")
+}
+
+func pushRows(n int) []domain.Notification {
+	out := make([]domain.Notification, n)
+	for i := range out {
+		out[i] = sms()
+		out[i].Channel = domain.ChannelPush
+	}
+	return out
+}
+
 func TestRelayDefaultsZeroBatchAndInterval(t *testing.T) {
 	outbox := &fakeOutbox{due: rows(3)}
 	pub := &fakePublisher{}
@@ -179,7 +236,7 @@ func TestRelayDefaultsZeroBatchAndInterval(t *testing.T) {
 	outbox.mu.Lock()
 	calls := outbox.calls
 	outbox.mu.Unlock()
-	if calls > 2 {
+	if calls > 2*len(domain.Channels) { // one claim per channel per drain
 		t.Fatalf("ClaimDue called %d times in 50ms: relay is busy-looping", calls)
 	}
 }
