@@ -71,3 +71,31 @@ func TestLoad_WorkerPrefetch(t *testing.T) {
 		}
 	}
 }
+
+// The api binary needs only the database; broker and provider are the
+// worker's concern, checked by ValidateWorker.
+func TestLoad_APIOnlyNeedsDatabase(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("AMQP_URL", "")
+	t.Setenv("PROVIDER_URL", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load without AMQP_URL/PROVIDER_URL: %v", err)
+	}
+	err = cfg.ValidateWorker()
+	if err == nil || !strings.Contains(err.Error(), "AMQP_URL") || !strings.Contains(err.Error(), "PROVIDER_URL") {
+		t.Fatalf("ValidateWorker = %v, want errors for AMQP_URL and PROVIDER_URL", err)
+	}
+}
+
+func TestValidateWorker_OK(t *testing.T) {
+	setRequired(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.ValidateWorker(); err != nil {
+		t.Fatalf("ValidateWorker: %v", err)
+	}
+}
