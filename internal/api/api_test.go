@@ -25,6 +25,7 @@ import (
 var fixedNow = time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
 
 type harness struct {
+	now     time.Time // what the API sees as the current time
 	store   *fakeStore
 	handler http.Handler
 	ready   error
@@ -33,12 +34,12 @@ type harness struct {
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	h := &harness{store: newFakeStore(), reg: prometheus.NewRegistry()}
+	h := &harness{now: fixedNow, store: newFakeStore(), reg: prometheus.NewRegistry()}
 	h.handler = api.NewRouter(api.Deps{
 		Store:          h.store,
 		Ready:          func(context.Context) error { return h.ready },
 		Logger:         observability.NewLogger(io.Discard, "error"),
-		Now:            func() time.Time { return fixedNow },
+		Now:            func() time.Time { return h.now },
 		Metrics:        observability.NewMetrics(h.reg),
 		MetricsHandler: observability.MetricsHandler(h.reg),
 	})
@@ -409,5 +410,107 @@ func TestUnknownRouteIsJSON404(t *testing.T) {
 	r := h.do(t, "GET", "/api/v1/nope", "")
 	if r.code != http.StatusNotFound || r.body["error"] == nil {
 		t.Fatalf("code=%d body=%s", r.code, r.raw)
+	}
+}
+
+// scheduledSMS is due 5 s after fixedNow.
+var scheduledSMS = `{"channel":"sms","recipient":"+905551234567","content":"hello","scheduled_at":"` +
+	fixedNow.Add(5*time.Second).Format(time.RFC3339) + `"}`
+
+// A client whose first response timed out retries with the same key after
+// scheduled_at has passed: that is a replay, not a new invalid request.
+func TestCreate_ScheduledReplayAfterDueReturns200(t *testing.T) {
+	h := newHarness(t)
+	first := h.do(t, "POST", "/api/v1/notifications", scheduledSMS, "Idempotency-Key", "k1")
+	h.now = fixedNow.Add(10 * time.Second)
+	second := h.do(t, "POST", "/api/v1/notifications", scheduledSMS, "Idempotency-Key", "k1")
+
+	if first.code != http.StatusAccepted || second.code != http.StatusOK || first.body["id"] != second.body["id"] {
+		t.Fatalf("first=%d second=%d (%s)", first.code, second.code, second.raw)
+	}
+}
+
+func TestCreate_ScheduledReplayWithOtherPayloadIs409(t *testing.T) {
+	h := newHarness(t)
+	h.do(t, "POST", "/api/v1/notifications", scheduledSMS, "Idempotency-Key", "k1")
+	h.now = fixedNow.Add(10 * time.Second)
+	other := strings.Replace(scheduledSMS, `"hello"`, `"other"`, 1)
+	if r := h.do(t, "POST", "/api/v1/notifications", other, "Idempotency-Key", "k1"); r.code != http.StatusConflict {
+		t.Fatalf("code = %d, want 409 (%s)", r.code, r.raw)
+	}
+}
+
+func TestCreate_PastScheduleWithUnknownKeyIs422(t *testing.T) {
+	h := newHarness(t)
+	h.now = fixedNow.Add(10 * time.Second)
+	r := h.do(t, "POST", "/api/v1/notifications", scheduledSMS, "Idempotency-Key", "new-key")
+	if r.code != http.StatusUnprocessableEntity || errDetails(t, r)["scheduled_at"] == nil {
+		t.Fatalf("code = %d, want 422 on scheduled_at (%s)", r.code, r.raw)
+	}
+}
+
+func TestBatch_ScheduledReplayAfterDueReusesRow(t *testing.T) {
+	h := newHarness(t)
+	item := strings.Replace(scheduledSMS, `}`, `,"idempotency_key":"b1"}`, 1)
+	first := h.do(t, "POST", "/api/v1/notifications/batch", batchBody(item))
+	h.now = fixedNow.Add(10 * time.Second)
+	second := h.do(t, "POST", "/api/v1/notifications/batch", batchBody(item))
+
+	if first.code != http.StatusAccepted || second.code != http.StatusAccepted {
+		t.Fatalf("first=%d second=%d (%s)", first.code, second.code, second.raw)
+	}
+	firstIDs, _ := first.body["ids"].([]any)
+	secondIDs, _ := second.body["ids"].([]any)
+	if len(firstIDs) != 1 || len(secondIDs) != 1 || firstIDs[0] != secondIDs[0] {
+		t.Fatalf("ids %v then %v, want the same row reused", firstIDs, secondIDs)
+	}
+}
+
+func TestBatch_PastScheduleWithUnknownKeyIs422(t *testing.T) {
+	h := newHarness(t)
+	h.now = fixedNow.Add(10 * time.Second)
+	item := strings.Replace(scheduledSMS, `}`, `,"idempotency_key":"never-seen"}`, 1)
+	r := h.do(t, "POST", "/api/v1/notifications/batch", batchBody(item))
+	if r.code != http.StatusUnprocessableEntity {
+		t.Fatalf("code = %d, want 422 (%s)", r.code, r.raw)
+	}
+}
+
+// Batch keys are trimmed like the header, so the same key written with
+// stray spaces cannot create a second notification.
+func TestBatch_IdempotencyKeyIsTrimmed(t *testing.T) {
+	h := newHarness(t)
+	b := h.do(t, "POST", "/api/v1/notifications/batch", batchBody(
+		`{"channel":"sms","recipient":"+905551234567","content":"hello","idempotency_key":"  order-1 "}`))
+	single := h.do(t, "POST", "/api/v1/notifications", validSMS, "Idempotency-Key", "order-1")
+
+	ids, _ := b.body["ids"].([]any)
+	if b.code != http.StatusAccepted || single.code != http.StatusOK || len(ids) != 1 || ids[0] != single.body["id"] {
+		t.Fatalf("batch=%d ids=%v single=%d id=%v, want the single create to replay the batch row",
+			b.code, ids, single.code, single.body["id"])
+	}
+	if single.body["idempotency_key"] != "order-1" {
+		t.Fatalf("stored key = %v, want trimmed order-1", single.body["idempotency_key"])
+	}
+}
+
+func TestBatch_BlankIdempotencyKeyIs422(t *testing.T) {
+	h := newHarness(t)
+	r := h.do(t, "POST", "/api/v1/notifications/batch", batchBody(
+		`{"channel":"sms","recipient":"+905551234567","content":"hello","idempotency_key":"   "}`))
+	item, _ := errDetails(t, r)["0"].(map[string]any)
+	if r.code != http.StatusUnprocessableEntity || item["idempotency_key"] == nil {
+		t.Fatalf("code = %d body %s, want 422 on idempotency_key", r.code, r.raw)
+	}
+}
+
+func TestBatch_TrimmedKeysDuplicateInBatch(t *testing.T) {
+	h := newHarness(t)
+	r := h.do(t, "POST", "/api/v1/notifications/batch", batchBody(
+		`{"channel":"sms","recipient":"+905551234567","content":"a","idempotency_key":"k"}`,
+		`{"channel":"sms","recipient":"+905551234567","content":"b","idempotency_key":" k"}`))
+	item, _ := errDetails(t, r)["1"].(map[string]any)
+	if r.code != http.StatusUnprocessableEntity || item["idempotency_key"] == nil {
+		t.Fatalf("code = %d body %s, want 422 duplicate key on item 1", r.code, r.raw)
 	}
 }

@@ -119,6 +119,13 @@ func (s *Store) Get(ctx context.Context, id uuid.UUID) (domain.Notification, err
 	return scan(s.pool.QueryRow(ctx, `SELECT `+columns+` FROM notifications WHERE id = $1`, id))
 }
 
+// HasIdempotencyKey reports whether a notification with key exists.
+func (s *Store) HasIdempotencyKey(ctx context.Context, key string) (bool, error) {
+	var exists bool
+	err := s.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM notifications WHERE idempotency_key = $1)`, key).Scan(&exists)
+	return exists, err
+}
+
 type querier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }

@@ -42,8 +42,16 @@ func (s *server) createNotification(w http.ResponseWriter, r *http.Request) {
 
 	now := s.now()
 	if err := domain.Validate(in, now); err != nil {
-		writeValidation(w, err)
-		return
+		replay, lookupErr := s.isReplay(r, in.IdempotencyKey, err)
+		if lookupErr != nil {
+			s.storeError(w, r, lookupErr)
+			return
+		}
+		if !replay {
+			writeValidation(w, err)
+			return
+		}
+		// Create finds the existing key: 200 with the stored row, or 409.
 	}
 
 	n := domain.NewNotification(in, observability.CorrelationID(r.Context()), now)
@@ -79,14 +87,25 @@ func (s *server) createBatch(w http.ResponseWriter, r *http.Request) {
 	ns := make([]domain.Notification, len(req.Notifications))
 	for i, item := range req.Notifications {
 		in := item.input()
-		in.IdempotencyKey = item.IdempotencyKey
+		if k := item.IdempotencyKey; k != nil {
+			// Trimmed like the header, so " k" and "k" are one key.
+			trimmed := strings.TrimSpace(*k)
+			in.IdempotencyKey = &trimmed
+		}
 		fields := map[string]string{}
 
 		var verr *domain.ValidationError
 		if err := domain.Validate(in, now); errors.As(err, &verr) {
-			fields = verr.Fields
+			replay, lookupErr := s.isReplay(r, in.IdempotencyKey, err)
+			if lookupErr != nil {
+				s.storeError(w, r, lookupErr)
+				return
+			}
+			if !replay { // a replay is resolved by CreateBatch reusing the row
+				fields = verr.Fields
+			}
 		}
-		if k := item.IdempotencyKey; k != nil {
+		if k := in.IdempotencyKey; k != nil {
 			switch j, dup := firstByKey[*k]; {
 			case len(*k) == 0 || len(*k) > maxIdempotencyKeyLen:
 				fields["idempotency_key"] = fmt.Sprintf("must be 1-%d characters", maxIdempotencyKeyLen)
@@ -233,4 +252,15 @@ func writeValidation(w http.ResponseWriter, err error) {
 		details[k] = v
 	}
 	writeError(w, http.StatusUnprocessableEntity, "validation_failed", "invalid notification", details)
+}
+
+// isReplay reports whether a request that failed validation only because
+// its scheduled_at has passed is a retry of an existing idempotency key. The
+// time was valid when the notification was first created, so the retry must
+// get the stored notification (or 409 for another payload), not 422.
+func (s *server) isReplay(r *http.Request, key *string, validationErr error) (bool, error) {
+	if key == nil || *key == "" || !domain.OnlyScheduledInPast(validationErr) {
+		return false, nil
+	}
+	return s.store.HasIdempotencyKey(r.Context(), *key)
 }

@@ -18,6 +18,7 @@ import (
 // NotificationStore is the persistence the API needs; *store.Store implements it.
 type NotificationStore interface {
 	Create(ctx context.Context, n domain.Notification) (domain.Notification, bool, error)
+	HasIdempotencyKey(ctx context.Context, key string) (bool, error)
 	CreateBatch(ctx context.Context, ns []domain.Notification) (uuid.UUID, []uuid.UUID, error)
 	Get(ctx context.Context, id uuid.UUID) (domain.Notification, error)
 	GetBatch(ctx context.Context, id uuid.UUID, p store.Page) (store.BatchSummary, []domain.Notification, string, error)

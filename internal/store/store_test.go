@@ -583,3 +583,17 @@ func TestListenSignalsOnInsert(t *testing.T) {
 		t.Fatal("channel not closed after cancel")
 	}
 }
+
+func TestHasIdempotencyKey(t *testing.T) {
+	s, _ := setup(t)
+	n := newSMS("x")
+	n.IdempotencyKey = strp("known")
+	mustCreate(t, s, n)
+
+	for key, want := range map[string]bool{"known": true, "unknown": false} {
+		got, err := s.HasIdempotencyKey(ctx, key)
+		if err != nil || got != want {
+			t.Errorf("HasIdempotencyKey(%q) = %v, %v; want %v", key, got, err, want)
+		}
+	}
+}

@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"errors"
 	"fmt"
 	"net/mail"
 	"regexp"
@@ -22,6 +23,11 @@ const (
 	maxPushTokenLen  = 512
 	maxScheduleAhead = 30 * 24 * time.Hour
 )
+
+// ScheduledInPast is the scheduled_at error for a time that is not in the
+// future. A replay of an existing idempotency key may carry it legitimately:
+// the time was in the future when the notification was first created.
+const ScheduledInPast = "must be in the future"
 
 var e164 = regexp.MustCompile(`^\+[1-9]\d{7,14}$`)
 
@@ -68,7 +74,7 @@ func Validate(in CreateInput, now time.Time) error {
 
 	if in.ScheduledAt != nil {
 		if !in.ScheduledAt.After(now) {
-			fields["scheduled_at"] = "must be in the future"
+			fields["scheduled_at"] = ScheduledInPast
 		} else if in.ScheduledAt.Sub(now) > maxScheduleAhead {
 			fields["scheduled_at"] = "must be within 30 days"
 		}
@@ -97,4 +103,14 @@ func validateRecipient(ch Channel, r string) string {
 		}
 	}
 	return ""
+}
+
+// OnlyScheduledInPast reports whether err is a *ValidationError whose only
+// problem is a scheduled_at that has already passed.
+func OnlyScheduledInPast(err error) bool {
+	var verr *ValidationError
+	if !errors.As(err, &verr) || len(verr.Fields) != 1 {
+		return false
+	}
+	return verr.Fields["scheduled_at"] == ScheduledInPast
 }
