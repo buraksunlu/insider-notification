@@ -70,8 +70,8 @@ func Classify(statusCode int, err error) Outcome {
 		statusCode >= 500:
 		return OutcomeRetry
 	default:
-		// 3xx left over after the client followed redirects and other 4xx:
-		// the request is wrong and retrying cannot fix it.
+		// 3xx (the client does not follow redirects) and other 4xx: the
+		// request or PROVIDER_URL is wrong and retrying cannot fix it.
 		return OutcomePermanent
 	}
 }
