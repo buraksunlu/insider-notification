@@ -50,6 +50,11 @@ func TestValidateTemplate(t *testing.T) {
 	if err := ValidateTemplate(ok); err != nil {
 		t.Fatalf("valid template: %v", err)
 	}
+	// Placeholders do not count toward the channel limit: only fixed text.
+	fits := CreateTemplateInput{Name: "fits", Channel: "sms", Body: strings.Repeat("ş", 150) + "{{a_long_placeholder_name}}"}
+	if err := ValidateTemplate(fits); err != nil {
+		t.Fatalf("150 fixed characters plus a placeholder: %v", err)
+	}
 	tests := []struct {
 		name  string
 		edit  func(*CreateTemplateInput)
@@ -64,6 +69,7 @@ func TestValidateTemplate(t *testing.T) {
 		{"invalid placeholder name", func(in *CreateTemplateInput) { in.Body = "Hi {{first name}}" }, "body"},
 		{"stray closing braces", func(in *CreateTemplateInput) { in.Body = "Hi }} there" }, "body"},
 		{"body over email limit", func(in *CreateTemplateInput) { in.Channel = "email"; in.Body = strings.Repeat("x", 10001) }, "body"},
+		{"fixed text over sms limit", func(in *CreateTemplateInput) { in.Body = strings.Repeat("ş", 161) + "{{code}}" }, "body"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

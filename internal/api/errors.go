@@ -64,6 +64,7 @@ func (s *server) storeError(w http.ResponseWriter, r *http.Request, err error) {
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) bool {
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
+	dec.UseNumber() // numbers in untyped fields (template variables) keep their exact text
 
 	err := dec.Decode(dst)
 	if err == nil {

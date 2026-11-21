@@ -15,8 +15,9 @@ type createRequest struct {
 	Priority    string     `json:"priority"`
 	ScheduledAt *time.Time `json:"scheduled_at"`
 	// TemplateID and Variables replace Content: the template is rendered.
-	TemplateID *string           `json:"template_id"`
-	Variables  map[string]string `json:"variables"`
+	TemplateID *string `json:"template_id"`
+	// Variables values may be strings, numbers or booleans (see variableText).
+	Variables map[string]any `json:"variables"`
 }
 
 func (c createRequest) input() domain.CreateInput {

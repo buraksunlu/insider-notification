@@ -102,7 +102,10 @@ func TestCreate_TemplateErrors(t *testing.T) {
 		{"template id not a uuid", req(`"template_id":"otp"`), "template_id", "UUID"},
 		{"missing variable", req(`"template_id":"` + sms + `","variables":{}`), "variables", "name"},
 		{"variables without template", req(`"content":"x","variables":{"name":"A"}`), "variables", "template_id"},
-		{"rendered content too long", req(`"template_id":"` + long + `","variables":{"text":"` + strings.Repeat("ş", 161) + `"}`), "content", "160"},
+		{"rendered content too long", req(`"template_id":"` + long + `","variables":{"text":"` + strings.Repeat("ş", 161) + `"}`), "variables", "rendered content must be at most 160"},
+		{"rendered content empty", req(`"template_id":"` + long + `","variables":{"text":"  "}`), "variables", "rendered content is required"},
+		{"variable is an object", req(`"template_id":"` + sms + `","variables":{"name":{"first":"A"}}`), "variables.name", "string, number or boolean"},
+		{"variable is null", req(`"template_id":"` + sms + `","variables":{"name":null}`), "variables.name", "string, number or boolean"},
 		{"channel mismatch", `{"channel":"email","recipient":"ada@example.com","template_id":"` + sms + `","variables":{"name":"A"}}`, "template_id", "sms"},
 	}
 	for _, tc := range tests {
@@ -143,5 +146,28 @@ func TestBatch_FromTemplate(t *testing.T) {
 	item1, _ := errDetails(t, bad)["1"].(map[string]any)
 	if bad.code != http.StatusUnprocessableEntity || item1["variables"] == nil {
 		t.Fatalf("code = %d body %s, want 422 on item 1 variables", bad.code, bad.raw)
+	}
+}
+
+// OTP codes and amounts are naturally numbers; they are rendered exactly.
+func TestCreate_TemplateAcceptsNumbersAndBooleans(t *testing.T) {
+	h := newHarness(t)
+	id := h.createTemplate(t, `{"name":"otp-num","channel":"sms","body":"Code {{code}}, total {{amount}}, vip {{vip}}"}`)
+	r := h.do(t, "POST", "/api/v1/notifications",
+		`{"channel":"sms","recipient":"+905551234567","template_id":"`+id+`","variables":{"code":4821,"amount":12345678901234567890.50,"vip":true}}`)
+	if r.code != http.StatusAccepted {
+		t.Fatalf("code = %d, body %s", r.code, r.raw)
+	}
+	if want := "Code 4821, total 12345678901234567890.50, vip true"; r.body["content"] != want {
+		t.Fatalf("content = %q, want %q", r.body["content"], want)
+	}
+}
+
+func TestTemplates_FixedTextOverChannelLimit(t *testing.T) {
+	h := newHarness(t)
+	body := `{"name":"too-long","channel":"sms","body":"` + strings.Repeat("x", 161) + ` {{code}}"}`
+	r := h.do(t, "POST", "/api/v1/templates", body)
+	if r.code != http.StatusUnprocessableEntity || errDetails(t, r)["body"] == nil {
+		t.Fatalf("code = %d body %s, want 422 on body", r.code, r.raw)
 	}
 }

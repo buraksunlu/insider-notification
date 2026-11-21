@@ -375,10 +375,15 @@ components:
         variables:
           type: object
           description: |
-            Values for the template's placeholders. A missing one is a 422 that
-            names it; extra ones are ignored. The rendered text must fit the
-            channel's content limit.
-          additionalProperties: {type: string}
+            Values for the template's placeholders: strings, numbers (inserted
+            with their exact JSON spelling) or booleans. A missing one is a 422
+            that names it; extra ones are ignored. The rendered text must fit
+            the channel's content limit.
+          additionalProperties:
+            oneOf:
+              - {type: string}
+              - {type: number}
+              - {type: boolean}
           example: {name: Ada, order: A-1001}
     BatchItem:
       allOf:
@@ -491,7 +496,10 @@ components:
           pattern: '^[A-Za-z0-9][A-Za-z0-9_.-]*$'
           description: Unique.
         channel: {$ref: '#/components/schemas/Channel'}
-        body: {type: string, maxLength: 10000}
+        body:
+          type: string
+          maxLength: 10000
+          description: The fixed text (without placeholders) must fit the channel's content limit.
     Template:
       type: object
       required: [id, name, channel, body, variables, created_at]

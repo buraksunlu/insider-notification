@@ -1,9 +1,11 @@
 package api
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -76,7 +78,7 @@ func (s *server) validate(r *http.Request, req createRequest, in *domain.CreateI
 		return &lookupError{err}
 	}
 	verr := domain.Validate(*in, now)
-	if len(tplFields) == 0 {
+	if req.TemplateID == nil && len(tplFields) == 0 {
 		return verr
 	}
 	fields := map[string]string{}
@@ -86,11 +88,20 @@ func (s *server) validate(r *http.Request, req createRequest, in *domain.CreateI
 			fields[k] = msg
 		}
 	}
-	if req.TemplateID != nil && in.Content == "" {
-		delete(fields, "content") // empty only because the template failed
+	if msg, ok := fields["content"]; ok && req.TemplateID != nil {
+		delete(fields, "content")
+		// The client sent no content: either the template failed (reported
+		// below) or its rendered text broke a content rule, which the
+		// variables caused.
+		if len(tplFields) == 0 {
+			fields["variables"] = "rendered content " + msg
+		}
 	}
 	for k, msg := range tplFields {
 		fields[k] = msg
+	}
+	if len(fields) == 0 {
+		return nil
 	}
 	return &domain.ValidationError{Fields: fields}
 }
@@ -107,6 +118,19 @@ func (s *server) resolveTemplate(r *http.Request, req createRequest, in *domain.
 	}
 	if req.Content != "" {
 		return map[string]string{"content": "must be empty when template_id is set"}, nil
+	}
+	vars := make(map[string]string, len(req.Variables))
+	bad := map[string]string{}
+	for k, v := range req.Variables {
+		text, ok := variableText(v)
+		if !ok {
+			bad["variables."+k] = "must be a string, number or boolean"
+			continue
+		}
+		vars[k] = text
+	}
+	if len(bad) > 0 {
+		return bad, nil
 	}
 	id, err := uuid.Parse(*req.TemplateID)
 	if err != nil {
@@ -133,11 +157,27 @@ func (s *server) resolveTemplate(r *http.Request, req createRequest, in *domain.
 		return map[string]string{"template_id": fmt.Sprintf("is a %s template, the notification channel is %s", t.Channel, ch)}, nil
 	}
 
-	content, err := domain.Render(t.Body, req.Variables)
+	content, err := domain.Render(t.Body, vars)
 	if err != nil {
 		return map[string]string{"variables": err.Error()}, nil
 	}
 	in.Content = content
 	in.TemplateID = &t.ID
 	return nil, nil
+}
+
+// variableText turns a JSON scalar into the text inserted into a template.
+// Numbers keep their exact JSON spelling (4821, 12.50); objects, arrays and
+// null are rejected.
+func variableText(v any) (string, bool) {
+	switch x := v.(type) {
+	case string:
+		return x, true
+	case json.Number:
+		return x.String(), true
+	case bool:
+		return strconv.FormatBool(x), true
+	default:
+		return "", false
+	}
 }
