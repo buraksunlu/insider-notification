@@ -48,6 +48,8 @@ func (s *server) storeError(w http.ResponseWriter, r *http.Request, err error) {
 		writeError(w, http.StatusConflict, "idempotency_conflict", store.ErrIdempotencyConflict.Error(), details)
 	case errors.Is(err, store.ErrDuplicateKeyInBatch):
 		writeError(w, http.StatusUnprocessableEntity, "validation_failed", store.ErrDuplicateKeyInBatch.Error(), details)
+	case errors.Is(err, store.ErrTemplateNameTaken):
+		writeError(w, http.StatusConflict, "template_name_taken", store.ErrTemplateNameTaken.Error(), nil)
 	case errors.Is(err, store.ErrBadCursor):
 		writeError(w, http.StatusBadRequest, "invalid_query", "invalid query parameters",
 			map[string]any{"cursor": "is not a valid cursor"})

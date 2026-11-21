@@ -41,7 +41,13 @@ func (s *server) createNotification(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := s.now()
-	if err := domain.Validate(in, now); err != nil {
+	err := s.validate(r, req, &in, now, templateCache{})
+	var storeErr *lookupError
+	if errors.As(err, &storeErr) {
+		s.storeError(w, r, storeErr.err)
+		return
+	}
+	if err != nil {
 		replay, lookupErr := s.isReplay(r, in.IdempotencyKey, err)
 		if lookupErr != nil {
 			s.storeError(w, r, lookupErr)
@@ -82,6 +88,7 @@ func (s *server) createBatch(w http.ResponseWriter, r *http.Request) {
 
 	now := s.now()
 	corr := observability.CorrelationID(r.Context())
+	templates := templateCache{} // a campaign batch reuses one template
 	details := map[string]any{}
 	firstByKey := map[string]int{}
 	ns := make([]domain.Notification, len(req.Notifications))
@@ -94,8 +101,14 @@ func (s *server) createBatch(w http.ResponseWriter, r *http.Request) {
 		}
 		fields := map[string]string{}
 
+		err := s.validate(r, item.createRequest, &in, now, templates)
+		var storeErr *lookupError
+		if errors.As(err, &storeErr) {
+			s.storeError(w, r, storeErr.err)
+			return
+		}
 		var verr *domain.ValidationError
-		if err := domain.Validate(in, now); errors.As(err, &verr) {
+		if errors.As(err, &verr) {
 			replay, lookupErr := s.isReplay(r, in.IdempotencyKey, err)
 			if lookupErr != nil {
 				s.storeError(w, r, lookupErr)
@@ -242,6 +255,10 @@ func parseTime(v, name string, details map[string]any) *time.Time {
 }
 
 func writeValidation(w http.ResponseWriter, err error) {
+	writeValidationAs(w, err, "invalid notification")
+}
+
+func writeValidationAs(w http.ResponseWriter, err error, message string) {
 	var verr *domain.ValidationError
 	if !errors.As(err, &verr) {
 		writeError(w, http.StatusUnprocessableEntity, "validation_failed", err.Error(), nil)
@@ -251,7 +268,7 @@ func writeValidation(w http.ResponseWriter, err error) {
 	for k, v := range verr.Fields {
 		details[k] = v
 	}
-	writeError(w, http.StatusUnprocessableEntity, "validation_failed", "invalid notification", details)
+	writeError(w, http.StatusUnprocessableEntity, "validation_failed", message, details)
 }
 
 // isReplay reports whether a request that failed validation only because

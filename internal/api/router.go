@@ -25,6 +25,9 @@ type NotificationStore interface {
 	Cancel(ctx context.Context, id uuid.UUID) (domain.Notification, error)
 	CancelBatch(ctx context.Context, id uuid.UUID) (int64, error)
 	List(ctx context.Context, f store.ListFilter) ([]domain.Notification, string, error)
+	CreateTemplate(ctx context.Context, t domain.Template) error
+	GetTemplate(ctx context.Context, id uuid.UUID) (domain.Template, error)
+	ListTemplates(ctx context.Context) ([]domain.Template, error)
 }
 
 // Deps are the collaborators of the HTTP API.
@@ -88,6 +91,9 @@ func NewRouter(d Deps) http.Handler {
 		r.Post("/notifications/{id}/cancel", s.cancelNotification)
 		r.Get("/batches/{id}", s.getBatch)
 		r.Post("/batches/{id}/cancel", s.cancelBatch)
+		r.Post("/templates", s.createTemplate)
+		r.Get("/templates", s.listTemplates)
+		r.Get("/templates/{id}", s.getTemplate)
 	})
 	return r
 }
