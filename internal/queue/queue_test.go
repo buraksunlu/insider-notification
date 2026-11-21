@@ -347,3 +347,25 @@ func TestDepthReaderRecoversClosedChannel(t *testing.T) {
 		t.Fatalf("Depths after the queue is back: %v (channel not reopened)", err)
 	}
 }
+
+func TestPublisherRecoversClosedChannel(t *testing.T) {
+	conn, ch := setup(t)
+	p := publisher(t, conn)
+	n := notification(domain.ChannelSMS, domain.PriorityNormal)
+
+	// Publishing to a missing exchange makes the broker close the channel.
+	if err := ch.ExchangeDelete(queue.DLX, false, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.PublishDLQ(context.Background(), n, "x"); err == nil {
+		t.Fatal("PublishDLQ to a missing exchange: want error")
+	}
+
+	if err := queue.Setup(ch); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Publish(context.Background(), n); err != nil {
+		t.Fatalf("Publish after the channel closed: %v (channel not reopened)", err)
+	}
+	waitDepth(t, ch, queue.Name(domain.ChannelSMS), 1)
+}
