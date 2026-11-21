@@ -17,10 +17,15 @@ import (
 	"github.com/buraksunlu/insider-notification/internal/store"
 )
 
-// storeWriteAttempts is how often a final state write is tried before the
-// message is requeued. A short database blip must not turn a delivered
-// message into a duplicate send after the sweeper resets it.
-const storeWriteAttempts = 3
+// State-write retry bounds. Once the provider has answered, its outcome
+// must be written: a requeued message is skipped (the row is processing)
+// and the sweeper then resets the row, so giving up early turns a delivered
+// message into a duplicate send. Writes are therefore retried for up to
+// DefaultStoreWriteTimeout, with pauses capped at maxStoreRetryPause.
+const (
+	DefaultStoreWriteTimeout = 30 * time.Second
+	maxStoreRetryPause       = 2 * time.Second
+)
 
 // HandlerStore is the part of the store the consumer needs.
 type HandlerStore interface {
@@ -57,6 +62,9 @@ type Handler struct {
 	// StoreRetryBase is the first pause between state-write attempts; it
 	// doubles each time. Zero means 100 ms.
 	StoreRetryBase time.Duration
+	// StoreWriteTimeout is how long a state write is retried before the
+	// message is requeued. Zero means DefaultStoreWriteTimeout.
+	StoreWriteTimeout time.Duration
 }
 
 // NewLimiters returns one token bucket per channel, perSecond tokens per
@@ -69,8 +77,11 @@ func NewLimiters(perSecond int) map[domain.Channel]*rate.Limiter {
 	return out
 }
 
-// Handle processes m. A nil return acks the message; an error requeues it
-// (used only when the database could not be reached, so nothing is lost).
+// Handle processes m. A nil return acks the message; an error requeues it.
+// That happens only when the database could not be reached: before the
+// claim nothing has been sent; after delivery the outcome write is retried
+// for StoreWriteTimeout first, because a requeue then means the sweeper
+// resets the row and the notification may be sent again (at-least-once).
 func (h *Handler) Handle(ctx context.Context, m queue.Message) error {
 	// Claim first: a cancelled or duplicate message is skipped without
 	// spending a rate-limit token.
@@ -101,7 +112,7 @@ func (h *Handler) Handle(ctx context.Context, m queue.Message) error {
 		}
 		log.InfoContext(ctx, "notification sent", "status", res.StatusCode, "latency_ms", res.Latency.Milliseconds())
 		now := h.Now()
-		if err := h.write(ctx, log, func() error { return h.Store.MarkSent(ctx, n.ID, res.MessageID, now) }); err != nil {
+		if err := h.write(ctx, log, func(ctx context.Context) error { return h.Store.MarkSent(ctx, n.ID, res.MessageID, now) }); err != nil {
 			return err
 		}
 		h.Metrics.Delivery(n.Channel, observability.ResultSent)
@@ -112,7 +123,7 @@ func (h *Handler) Handle(ctx context.Context, m queue.Message) error {
 		reason := failureReason(res, sendErr)
 		delay := NextDelay(n.Attempts, h.RetryBase, res.RetryAfter, h.Rand)
 		log.WarnContext(ctx, "delivery failed, retry scheduled", "reason", reason, "retry_in", delay.String())
-		if err := h.write(ctx, log, func() error { return h.Store.ScheduleRetry(ctx, n.ID, h.Now().Add(delay), reason) }); err != nil {
+		if err := h.write(ctx, log, func(ctx context.Context) error { return h.Store.ScheduleRetry(ctx, n.ID, h.Now().Add(delay), reason) }); err != nil {
 			return err
 		}
 		h.Metrics.Delivery(n.Channel, observability.ResultRetry)
@@ -126,7 +137,7 @@ func (h *Handler) Handle(ctx context.Context, m queue.Message) error {
 		log.ErrorContext(ctx, "delivery failed permanently", "reason", reason)
 		// The database is the source of truth: mark failed first, then
 		// mirror to the DLQ. A DLQ failure is logged, the row stays failed.
-		if err := h.write(ctx, log, func() error { return h.Store.MarkFailed(ctx, n.ID, reason) }); err != nil {
+		if err := h.write(ctx, log, func(ctx context.Context) error { return h.Store.MarkFailed(ctx, n.ID, reason) }); err != nil {
 			return err
 		}
 		h.Metrics.Delivery(n.Channel, observability.ResultFailed)
@@ -182,34 +193,40 @@ func (h *Handler) recordAttempt(ctx context.Context, log *slog.Logger, n domain.
 	}
 }
 
-// write runs a state transition, retrying transient errors with a short
-// doubling pause. ErrStateConflict means the row has already moved on
-// (e.g. reset by the sweeper) and is not retried or requeued.
-func (h *Handler) write(ctx context.Context, log *slog.Logger, fn func() error) error {
+// write runs a state transition, retrying transient errors with a doubling
+// pause until StoreWriteTimeout. It runs on a context detached from ctx's
+// cancellation: on shutdown the delivery has already happened and its
+// outcome must still be recorded. ErrStateConflict means the row has
+// already moved on (e.g. reset by the sweeper) and is not retried.
+func (h *Handler) write(ctx context.Context, log *slog.Logger, fn func(context.Context) error) error {
+	timeout := h.StoreWriteTimeout
+	if timeout <= 0 {
+		timeout = DefaultStoreWriteTimeout
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
+	defer cancel()
+
 	pause := h.StoreRetryBase
 	if pause <= 0 {
 		pause = 100 * time.Millisecond
 	}
-	var err error
-	for i := range storeWriteAttempts {
-		if err = fn(); err == nil {
+	for {
+		err := fn(ctx)
+		if err == nil {
 			return nil
 		}
 		if errors.Is(err, store.ErrStateConflict) {
 			log.WarnContext(ctx, "state transition skipped: row changed concurrently")
 			return nil
 		}
-		if i < storeWriteAttempts-1 {
-			select {
-			case <-time.After(pause):
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-			pause *= 2
+		select {
+		case <-time.After(pause):
+		case <-ctx.Done():
+			log.ErrorContext(ctx, "state transition failed, message requeued", "error", err)
+			return err
 		}
+		pause = min(pause*2, maxStoreRetryPause)
 	}
-	log.ErrorContext(ctx, "state transition failed, message requeued", "error", err)
-	return err
 }
 
 func failureReason(res provider.Result, sendErr error) string {

@@ -29,6 +29,8 @@ type fakeStore struct {
 
 	startErr      error
 	markSentErrs  []error // returned by successive MarkSent calls, then nil
+	markSentErr   error   // returned by every MarkSent call once markSentErrs is used up
+	sentCtxErrs   []error // ctx.Err() seen by each MarkSent call
 	recordErr     error
 	sentID        *string
 	sentCalls     int
@@ -58,16 +60,20 @@ func (f *fakeStore) StartProcessing(_ context.Context, id uuid.UUID) (domain.Not
 	return f.n, true, nil
 }
 
-func (f *fakeStore) MarkSent(_ context.Context, _ uuid.UUID, id *string, _ time.Time) error {
+func (f *fakeStore) MarkSent(ctx context.Context, _ uuid.UUID, id *string, _ time.Time) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.sentCalls++
+	f.sentCtxErrs = append(f.sentCtxErrs, ctx.Err())
 	if len(f.markSentErrs) > 0 {
 		err := f.markSentErrs[0]
 		f.markSentErrs = f.markSentErrs[1:]
 		if err != nil {
 			return err
 		}
+	}
+	if f.markSentErr != nil {
+		return f.markSentErr
 	}
 	f.n.Status = domain.StatusSent
 	f.sentID = id
@@ -108,12 +114,13 @@ func (f *fakeStore) requeue() {
 }
 
 type fakeSender struct {
-	mu    sync.Mutex
-	res   provider.Result
-	err   error
-	calls []provider.Request
-	keys  []string
-	corrs []string
+	mu     sync.Mutex
+	onSend func() // runs inside Send, e.g. to cancel the caller's context
+	res    provider.Result
+	err    error
+	calls  []provider.Request
+	keys   []string
+	corrs  []string
 }
 
 func (s *fakeSender) Send(_ context.Context, key, corr string, r provider.Request) (provider.Result, error) {
@@ -122,6 +129,9 @@ func (s *fakeSender) Send(_ context.Context, key, corr string, r provider.Reques
 	s.calls = append(s.calls, r)
 	s.keys = append(s.keys, key)
 	s.corrs = append(s.corrs, corr)
+	if s.onSend != nil {
+		s.onSend()
+	}
 	return s.res, s.err
 }
 
@@ -376,15 +386,53 @@ func TestHandleRetriesStateWrite(t *testing.T) {
 	}
 }
 
-func TestHandleStateWriteGivesUp(t *testing.T) {
+// A delivered message whose outcome cannot be written would be resent
+// after the sweeper resets the row, so a short outage is outlasted rather
+// than requeued after a fixed number of tries.
+func TestHandleStateWriteOutlastsShortOutage(t *testing.T) {
 	r := newRig(t)
 	boom := errors.New("db down")
-	r.store.markSentErrs = []error{boom, boom, boom, boom}
+	r.store.markSentErrs = make([]error, 10)
+	for i := range r.store.markSentErrs {
+		r.store.markSentErrs[i] = boom
+	}
+	if err := r.h.Handle(context.Background(), r.msg()); err != nil {
+		t.Fatalf("Handle: %v, want nil after the database comes back", err)
+	}
+	if r.store.sentCalls != 11 || r.store.n.Status != domain.StatusSent {
+		t.Fatalf("MarkSent calls %d status %s, want 11 and sent", r.store.sentCalls, r.store.n.Status)
+	}
+}
+
+func TestHandleStateWriteGivesUpAfterTimeout(t *testing.T) {
+	r := newRig(t)
+	r.h.StoreWriteTimeout = 30 * time.Millisecond
+	boom := errors.New("db down")
+	r.store.markSentErr = boom
 	if err := r.h.Handle(context.Background(), r.msg()); !errors.Is(err, boom) {
 		t.Fatalf("Handle: %v, want %v", err, boom)
 	}
-	if r.store.sentCalls != 3 {
-		t.Errorf("MarkSent calls = %d, want 3", r.store.sentCalls)
+	if r.store.sentCalls < 3 {
+		t.Errorf("MarkSent calls = %d, want several tries within the timeout", r.store.sentCalls)
+	}
+}
+
+// Shutdown must not abandon the outcome of a delivery that already happened.
+func TestHandleStateWriteIgnoresCancelledContext(t *testing.T) {
+	r := newRig(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	r.send.onSend = cancel
+	r.store.markSentErrs = []error{errors.New("blip")}
+	if err := r.h.Handle(ctx, r.msg()); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if r.store.n.Status != domain.StatusSent {
+		t.Fatalf("status = %s, want sent", r.store.n.Status)
+	}
+	for i, err := range r.store.sentCtxErrs {
+		if err != nil {
+			t.Errorf("MarkSent call %d got a done context: %v", i+1, err)
+		}
 	}
 }
 
@@ -597,8 +645,8 @@ func TestHandleEndToEndStartsWhenDue(t *testing.T) {
 
 func TestHandleNoMetricWhenStateWriteFails(t *testing.T) {
 	r, reg := metricsRig(t)
-	boom := errors.New("db down")
-	r.store.markSentErrs = []error{boom, boom, boom}
+	r.h.StoreWriteTimeout = 20 * time.Millisecond
+	r.store.markSentErr = errors.New("db down")
 	if err := r.h.Handle(context.Background(), r.msg()); err == nil {
 		t.Fatal("Handle: want error")
 	}
