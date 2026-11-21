@@ -105,6 +105,7 @@ type Notification struct {
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
 	SentAt            *time.Time
+	TemplateID        *uuid.UUID
 }
 
 // CreateInput is a client request to create a notification.
@@ -115,8 +116,8 @@ type CreateInput struct {
 	Priority       string
 	IdempotencyKey *string
 	ScheduledAt    *time.Time
-	TemplateID     *uuid.UUID
-	Variables      map[string]string
+	// TemplateID is set when Content was rendered from a template.
+	TemplateID *uuid.UUID
 }
 
 // NewNotification builds a pending notification from an already validated input.
@@ -140,6 +141,7 @@ func NewNotification(in CreateInput, correlationID string, now time.Time) Notifi
 		MaxAttempts:    DefaultMaxAttempts,
 		NextAttemptAt:  next,
 		ScheduledAt:    in.ScheduledAt,
+		TemplateID:     in.TemplateID,
 		CorrelationID:  correlationID,
 		CreatedAt:      now,
 		UpdatedAt:      now,
