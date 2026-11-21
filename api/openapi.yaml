@@ -21,6 +21,7 @@ servers:
 tags:
   - name: notifications
   - name: batches
+  - name: templates
   - name: operations
 paths:
   /api/v1/notifications:
@@ -49,6 +50,8 @@ paths:
                 value: {channel: email, recipient: ada@example.com, content: 'Weekly digest', scheduled_at: '2026-12-01T09:00:00Z'}
               push:
                 value: {channel: push, recipient: 'fcm-device-token-123', content: 'Your order has shipped', priority: low}
+              fromTemplate:
+                value: {channel: sms, recipient: '+905551234567', template_id: 7d1f3a2b-9c4e-4f6a-8b1d-2e3f4a5b6c7d, variables: {name: Ada, order: A-1001}}
       responses:
         '202':
           description: Created and accepted for delivery.
@@ -202,6 +205,68 @@ paths:
         '400': {$ref: '#/components/responses/BadRequest'}
         '404': {$ref: '#/components/responses/NotFound'}
         '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/templates:
+    post:
+      tags: [templates]
+      operationId: createTemplate
+      summary: Create a template
+      description: |
+        A reusable body with `{{variable}}` placeholders (letters, digits and `_`;
+        spaces inside the braces are allowed). Templates are immutable: a
+        notification's `template_id` always names the body it was rendered from.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CreateTemplate'}
+            example: {name: order-shipped, channel: sms, body: 'Hi {{name}}, your order {{order}} has shipped'}
+      responses:
+        '201':
+          description: Created.
+          headers:
+            Location:
+              schema: {type: string, example: /api/v1/templates/7d1f3a2b-9c4e-4f6a-8b1d-2e3f4a5b6c7d}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Template'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationFailed'}
+        '500': {$ref: '#/components/responses/InternalError'}
+    get:
+      tags: [templates]
+      operationId: listTemplates
+      summary: List templates
+      description: All templates, sorted by name.
+      responses:
+        '200':
+          description: Every template.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: {$ref: '#/components/schemas/Template'}
+        '500': {$ref: '#/components/responses/InternalError'}
+  /api/v1/templates/{id}:
+    get:
+      tags: [templates]
+      operationId: getTemplate
+      summary: Get a template
+      parameters:
+        - $ref: '#/components/parameters/ID'
+      responses:
+        '200':
+          description: The template.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Template'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '500': {$ref: '#/components/responses/InternalError'}
   /healthz:
     get:
       tags: [operations]
@@ -282,8 +347,10 @@ components:
       enum: [pending, queued, processing, sent, failed, cancelled]
     CreateNotification:
       type: object
-      description: Unknown fields are rejected with 422, so a typo is never silently ignored.
-      required: [channel, recipient, content]
+      description: |
+        Give either `content` or `template_id` (with `variables`), not both.
+        Unknown fields are rejected with 422, so a typo is never silently ignored.
+      required: [channel, recipient]
       properties:
         channel: {$ref: '#/components/schemas/Channel'}
         recipient:
@@ -301,6 +368,18 @@ components:
           type: string
           format: date-time
           description: Deliver at this time instead of now. Must be in the future and within 30 days.
+        template_id:
+          type: string
+          format: uuid
+          description: Render this template instead of giving `content`. Its channel must match.
+        variables:
+          type: object
+          description: |
+            Values for the template's placeholders. A missing one is a 422 that
+            names it; extra ones are ignored. The rendered text must fit the
+            channel's content limit.
+          additionalProperties: {type: string}
+          example: {name: Ada, order: A-1001}
     BatchItem:
       allOf:
         - $ref: '#/components/schemas/CreateNotification'
@@ -346,6 +425,7 @@ components:
         created_at: {type: string, format: date-time}
         updated_at: {type: string, format: date-time}
         sent_at: {type: string, format: date-time}
+        template_id: {type: string, format: uuid, description: The template the content was rendered from.}
       example:
         id: 0b7e9f2e-3c1d-4d55-9d4e-6f1a2b3c4d5e
         channel: sms
@@ -401,6 +481,37 @@ components:
       properties:
         batch_id: {type: string, format: uuid}
         cancelled: {type: integer}
+    CreateTemplate:
+      type: object
+      required: [name, channel, body]
+      properties:
+        name:
+          type: string
+          maxLength: 100
+          pattern: '^[A-Za-z0-9][A-Za-z0-9_.-]*$'
+          description: Unique.
+        channel: {$ref: '#/components/schemas/Channel'}
+        body: {type: string, maxLength: 10000}
+    Template:
+      type: object
+      required: [id, name, channel, body, variables, created_at]
+      properties:
+        id: {type: string, format: uuid}
+        name: {type: string}
+        channel: {$ref: '#/components/schemas/Channel'}
+        body: {type: string}
+        variables:
+          type: array
+          description: Placeholder names in the body, sorted.
+          items: {type: string}
+        created_at: {type: string, format: date-time}
+      example:
+        id: 7d1f3a2b-9c4e-4f6a-8b1d-2e3f4a5b6c7d
+        name: order-shipped
+        channel: sms
+        body: 'Hi {{name}}, your order {{order}} has shipped'
+        variables: [name, order]
+        created_at: '2026-11-21T10:00:00Z'
     Health:
       type: object
       required: [status]
@@ -417,8 +528,8 @@ components:
             code:
               type: string
               enum: [invalid_json, invalid_query, invalid_id, validation_failed, idempotency_conflict,
-                     not_cancellable, not_found, method_not_allowed, payload_too_large, unavailable,
-                     internal_error]
+                     not_cancellable, template_name_taken, not_found, method_not_allowed, payload_too_large,
+                     unavailable, internal_error]
             message: {type: string}
             details:
               type: object
@@ -438,7 +549,7 @@ components:
           schema: {$ref: '#/components/schemas/Error'}
           example: {error: {code: validation_failed, message: invalid notification, details: {recipient: must be an E.164 phone number, e.g. +905551234567}}}
     Conflict:
-      description: Idempotency key reused with another payload, or the notification can no longer be cancelled.
+      description: Idempotency key reused with another payload, a notification that can no longer be cancelled, or a template name that is taken.
       content:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}

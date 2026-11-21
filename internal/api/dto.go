@@ -14,6 +14,9 @@ type createRequest struct {
 	Content     string     `json:"content"`
 	Priority    string     `json:"priority"`
 	ScheduledAt *time.Time `json:"scheduled_at"`
+	// TemplateID and Variables replace Content: the template is rendered.
+	TemplateID *string           `json:"template_id"`
+	Variables  map[string]string `json:"variables"`
 }
 
 func (c createRequest) input() domain.CreateInput {
@@ -51,6 +54,7 @@ type notificationDTO struct {
 	CreatedAt         time.Time  `json:"created_at"`
 	UpdatedAt         time.Time  `json:"updated_at"`
 	SentAt            *time.Time `json:"sent_at,omitempty"`
+	TemplateID        *uuid.UUID `json:"template_id,omitempty"`
 }
 
 func toDTO(n domain.Notification) notificationDTO {
@@ -61,6 +65,7 @@ func toDTO(n domain.Notification) notificationDTO {
 		Attempts: n.Attempts, MaxAttempts: n.MaxAttempts, ScheduledAt: n.ScheduledAt,
 		ProviderMessageID: n.ProviderMessageID, LastError: n.LastError,
 		CorrelationID: n.CorrelationID, CreatedAt: n.CreatedAt, UpdatedAt: n.UpdatedAt, SentAt: n.SentAt,
+		TemplateID: n.TemplateID,
 	}
 	// next_attempt_at only means something while the notification waits.
 	if n.Status == domain.StatusPending {
@@ -95,4 +100,30 @@ type batchResponse struct {
 	CreatedAt  time.Time         `json:"created_at"`
 	Data       []notificationDTO `json:"data"`
 	NextCursor string            `json:"next_cursor,omitempty"`
+}
+
+type createTemplateRequest struct {
+	Name    string `json:"name"`
+	Channel string `json:"channel"`
+	Body    string `json:"body"`
+}
+
+type templateDTO struct {
+	ID        uuid.UUID `json:"id"`
+	Name      string    `json:"name"`
+	Channel   string    `json:"channel"`
+	Body      string    `json:"body"`
+	Variables []string  `json:"variables"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+func toTemplateDTO(t domain.Template) templateDTO {
+	return templateDTO{
+		ID: t.ID, Name: t.Name, Channel: string(t.Channel), Body: t.Body,
+		Variables: t.Variables(), CreatedAt: t.CreatedAt,
+	}
+}
+
+type templateListResponse struct {
+	Data []templateDTO `json:"data"`
 }

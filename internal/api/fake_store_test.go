@@ -17,6 +17,7 @@ type fakeStore struct {
 	byID      map[uuid.UUID]domain.Notification
 	byKey     map[string]uuid.UUID
 	batches   map[uuid.UUID]int
+	templates map[uuid.UUID]domain.Template
 	createErr error
 	cancelErr error
 	listErr   error
@@ -25,7 +26,10 @@ type fakeStore struct {
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{byID: map[uuid.UUID]domain.Notification{}, byKey: map[string]uuid.UUID{}, batches: map[uuid.UUID]int{}}
+	return &fakeStore{
+		byID: map[uuid.UUID]domain.Notification{}, byKey: map[string]uuid.UUID{}, batches: map[uuid.UUID]int{},
+		templates: map[uuid.UUID]domain.Template{},
+	}
 }
 
 func (f *fakeStore) Create(_ context.Context, n domain.Notification) (domain.Notification, bool, error) {
@@ -161,4 +165,36 @@ func (f *fakeStore) put(n domain.Notification) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.byID[n.ID] = n
+}
+
+func (f *fakeStore) CreateTemplate(_ context.Context, t domain.Template) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, existing := range f.templates {
+		if existing.Name == t.Name {
+			return store.ErrTemplateNameTaken
+		}
+	}
+	f.templates[t.ID] = t
+	return nil
+}
+
+func (f *fakeStore) GetTemplate(_ context.Context, id uuid.UUID) (domain.Template, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	t, ok := f.templates[id]
+	if !ok {
+		return t, store.ErrNotFound
+	}
+	return t, nil
+}
+
+func (f *fakeStore) ListTemplates(context.Context) ([]domain.Template, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []domain.Template{}
+	for _, t := range f.templates {
+		out = append(out, t)
+	}
+	return out, nil
 }
