@@ -238,7 +238,7 @@ func TestClaimDue_RespectsScheduleAndPriority(t *testing.T) {
 	}
 
 	var published []domain.Notification
-	count, err := s.ClaimDue(ctx, 10, func(n domain.Notification) error {
+	count, err := s.ClaimDue(ctx, domain.ChannelSMS, 10, func(n domain.Notification) error {
 		published = append(published, n)
 		return nil
 	})
@@ -262,7 +262,7 @@ func TestClaimDue_RollsBackOnPublishError(t *testing.T) {
 	s, _ := setup(t)
 	n := mustCreate(t, s, newSMS("x"))
 
-	_, err := s.ClaimDue(ctx, 10, func(domain.Notification) error { return errors.New("broker down") })
+	_, err := s.ClaimDue(ctx, domain.ChannelSMS, 10, func(domain.Notification) error { return errors.New("broker down") })
 	if err == nil {
 		t.Fatal("expected publish error")
 	}
@@ -279,7 +279,7 @@ func TestClaimDue_CommitsBeforePublish(t *testing.T) {
 	n := mustCreate(t, s, newSMS("x"))
 
 	var started bool
-	_, err := s.ClaimDue(ctx, 10, func(m domain.Notification) error {
+	_, err := s.ClaimDue(ctx, domain.ChannelSMS, 10, func(m domain.Notification) error {
 		// What a consumer does on receipt, on another connection.
 		_, ok, err := s.StartProcessing(ctx, m.ID)
 		started = ok
@@ -304,7 +304,7 @@ func TestClaimDue_PublishErrorReleasesOnlyUnpublished(t *testing.T) {
 	}
 
 	calls := 0
-	count, err := s.ClaimDue(ctx, 10, func(domain.Notification) error {
+	count, err := s.ClaimDue(ctx, domain.ChannelSMS, 10, func(domain.Notification) error {
 		calls++
 		if calls == 2 {
 			return errors.New("broker down")
@@ -648,5 +648,59 @@ func TestCreate_StoresTemplateID(t *testing.T) {
 	got, err := s.Get(ctx, n.ID)
 	if err != nil || got.TemplateID == nil || *got.TemplateID != tpl.ID {
 		t.Fatalf("template_id = %v (err %v), want %s", got.TemplateID, err, tpl.ID)
+	}
+}
+
+func TestClaimDue_OnlyClaimsTheGivenChannel(t *testing.T) {
+	s, _ := setup(t)
+	smsRow := mustCreate(t, s, newSMS("sms"))
+	push := domain.NewNotification(domain.CreateInput{Channel: "push", Recipient: "token-1", Content: "push"}, "c", past())
+	mustCreate(t, s, push)
+
+	var got []uuid.UUID
+	n, err := s.ClaimDue(ctx, domain.ChannelPush, 10, func(m domain.Notification) error {
+		got = append(got, m.ID)
+		return nil
+	})
+	if err != nil || n != 1 || got[0] != push.ID {
+		t.Fatalf("claim push: n=%d ids=%v err=%v, want only the push row", n, got, err)
+	}
+	if row, _ := s.Get(ctx, smsRow.ID); row.Status != domain.StatusPending {
+		t.Fatalf("sms row status = %s, want pending (other channel)", row.Status)
+	}
+}
+
+func TestQueuedByChannel(t *testing.T) {
+	s, pool := setup(t)
+	for i := range 3 {
+		n := mustCreate(t, s, newSMS(fmt.Sprint(i)))
+		if i < 2 {
+			setStatus(t, pool, n.ID, domain.StatusQueued)
+		}
+	}
+	push := domain.NewNotification(domain.CreateInput{Channel: "push", Recipient: "token-1", Content: "p"}, "c", past())
+	mustCreate(t, s, push)
+	setStatus(t, pool, push.ID, domain.StatusQueued)
+
+	got, err := s.QueuedByChannel(ctx)
+	if err != nil || got[domain.ChannelSMS] != 2 || got[domain.ChannelPush] != 1 || got[domain.ChannelEmail] != 0 {
+		t.Fatalf("QueuedByChannel = %v, %v; want sms 2, push 1, email 0", got, err)
+	}
+}
+
+// A row stuck on its last attempt is failed, not retried a ninth time.
+func TestResetStuck_FailsRowsOutOfAttempts(t *testing.T) {
+	s, pool := setup(t)
+	last := mustCreate(t, s, newSMS("last attempt"))
+	if _, err := pool.Exec(ctx, `UPDATE notifications SET status='processing', attempts=max_attempts,
+		updated_at = now() - interval '5 minutes' WHERE id=$1`, last.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ResetStuck(ctx, 2*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.Get(ctx, last.ID)
+	if got.Status != domain.StatusFailed || got.LastError == nil || !strings.Contains(*got.LastError, "last attempt") {
+		t.Fatalf("status %s last_error %v, want failed with a reason", got.Status, got.LastError)
 	}
 }
