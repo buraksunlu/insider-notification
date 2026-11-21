@@ -243,3 +243,33 @@ func TestIdempotentCreate(t *testing.T) {
 		t.Fatalf("provider received it %d times, want 1", c)
 	}
 }
+
+func TestTemplateIsRenderedAndDelivered(t *testing.T) {
+	name := fmt.Sprintf("e2e-otp-%d", time.Now().UnixNano())
+	code, raw := call(t, "POST", "/api/v1/templates", map[string]any{
+		"name": name, "channel": "sms", "body": "Merhaba {{name}}, kodunuz {{code}}",
+	})
+	var tpl struct {
+		ID string `json:"id"`
+	}
+	if code != http.StatusCreated || json.Unmarshal(raw, &tpl) != nil {
+		t.Fatalf("create template: %d %s", code, raw)
+	}
+
+	code, raw = call(t, "POST", "/api/v1/notifications", map[string]any{
+		"channel": "sms", "recipient": "+905551234567", "template_id": tpl.ID,
+		"variables": map[string]string{"name": "Şule", "code": "4821"},
+	})
+	var n struct {
+		ID         string `json:"id"`
+		Content    string `json:"content"`
+		TemplateID string `json:"template_id"`
+	}
+	if code != http.StatusAccepted || json.Unmarshal(raw, &n) != nil {
+		t.Fatalf("create from template: %d %s", code, raw)
+	}
+	if n.Content != "Merhaba Şule, kodunuz 4821" || n.TemplateID != tpl.ID {
+		t.Fatalf("content %q template_id %q", n.Content, n.TemplateID)
+	}
+	waitFor(t, n.ID, "sent", 20*time.Second)
+}
