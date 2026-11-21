@@ -54,7 +54,11 @@ Kafka was excluded: no native priority, heavy for the scope.
                                                                provider (webhook.site)
 ```
 
-Two binaries from one module: `cmd/api`, `cmd/worker`.
+Two binaries from one module: `cmd/api`, `cmd/worker` (plus `cmd/mockprovider` for local runs).
+Both shut down gracefully on SIGTERM: the API drains in-flight requests, the worker stops consuming
+and lets in-flight deliveries finish. A lost RabbitMQ connection is not recovered in-process: the
+worker exits non-zero and the orchestrator (compose `restart: unless-stopped`) restarts it. Nothing
+is lost, since every row lives in Postgres and the sweeper recovers rows left `queued`/`processing`.
 
 ### Key decision: the DB is the outbox, RabbitMQ is the delivery pipe
 The API never publishes to RabbitMQ directly. It only inserts rows (`status=pending`) in one
@@ -175,7 +179,7 @@ Graceful shutdown: stop consuming, finish in-flight, close channels (context + `
 | `GET /notifications` | Filters `status, channel, from, to` (RFC 3339, inclusive); keyset pagination `limit` (1–100, default 20) + opaque `cursor`. Response `{data: [...], next_cursor}`; bad parameters → 400. |
 | `POST /templates`, `GET /templates/{id}` | Bonus. |
 | `GET /healthz` | Liveness. |
-| `GET /readyz` | DB + RabbitMQ reachable. |
+| `GET /readyz` | DB reachable (the API does not talk to RabbitMQ). |
 | `GET /metrics` | Prometheus. |
 | `GET /docs` | Swagger UI over the spec. |
 
@@ -220,14 +224,20 @@ internal/
   provider    webhook client
   api         chi router, handlers, middleware, error mapping
   observability  metrics, logger
-migrations/   api/openapi.yaml   deploy/ (Dockerfile)   docker-compose.yml   Makefile
+migrations/   api/openapi.yaml (embedded, served at /openapi.yaml)   Dockerfile   docker-compose.yml   Makefile   e2e/
 ```
 
 ## 10. Running and testing
-- `docker compose up`: postgres, rabbitmq (management UI), `migrate` one-shot, api, worker, swagger-ui.
-- `PROVIDER_URL` env. Defaults to the candidate's webhook.site URL. A tiny `mockprovider`
-  (configurable 202/500/latency) ships for load and failure demos, because webhook.site
-  free tier limits request volume.
+- `docker compose up`: postgres, rabbitmq (management UI), `migrate` one-shot, api (Swagger UI at
+  `/docs`, same origin so "Try it out" needs no CORS), worker, mockprovider.
+- `PROVIDER_URL` env. Defaults to the bundled `mockprovider`, because the webhook.site free tier
+  limits request volume and its URLs expire; `PROVIDER_URL=https://webhook.site/<uuid> docker
+  compose up` delivers there instead. The mock answers with the spec's 202 body; `FAIL_RATE` and
+  `LATENCY_MS` simulate an unreliable provider, content starting with `mock:<code>` forces that
+  status, and `GET /received/{id}` counts deliveries per notification for the end-to-end tests.
+- `make e2e`: starts the stack with `RETRY_BASE=50ms` and drives it over HTTP: delivery, retries
+  exhausted → `failed` + DLQ, 4xx not retried, cancelled scheduled notification never sent, batch
+  summary, idempotent replay.
 - `make test`: unit tests (validation, backoff, classifier, state guard, handlers with fakes)
   plus integration tests with testcontainers-go (Postgres + RabbitMQ: create → sent,
   retry → DLQ, cancel, idempotent replay). Requires Docker only.
