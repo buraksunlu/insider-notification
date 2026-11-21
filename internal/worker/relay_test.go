@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/buraksunlu/insider-notification/internal/domain"
+	"github.com/buraksunlu/insider-notification/internal/provider"
 	"github.com/buraksunlu/insider-notification/internal/queue"
 	"github.com/buraksunlu/insider-notification/internal/store"
 	"github.com/buraksunlu/insider-notification/internal/testutil"
@@ -26,7 +27,7 @@ type fakeOutbox struct {
 	calls   int
 }
 
-func (f *fakeOutbox) ClaimDue(_ context.Context, limit int, publish func([]domain.Notification) error) (int, error) {
+func (f *fakeOutbox) ClaimDue(_ context.Context, limit int, publish func(domain.Notification) error) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
@@ -34,13 +35,12 @@ func (f *fakeOutbox) ClaimDue(_ context.Context, limit int, publish func([]domai
 		return 0, f.failErr
 	}
 	n := min(limit, len(f.due))
-	if n == 0 {
-		return 0, nil
+	for i := range n {
+		if err := publish(f.due[0]); err != nil {
+			return i, err // unpublished rows stay due, like the real release
+		}
+		f.due = f.due[1:]
 	}
-	if err := publish(f.due[:n]); err != nil {
-		return 0, err // rows stay due, like a rolled-back transaction
-	}
-	f.due = f.due[n:]
 	return n, nil
 }
 
@@ -168,9 +168,27 @@ func TestRelayKeepsRunningAfterErrors(t *testing.T) {
 	eventually(t, time.Second, func() bool { return pub.count() == 2 }, "relay stopped after a publish error")
 }
 
+func TestRelayDefaultsZeroBatchAndInterval(t *testing.T) {
+	outbox := &fakeOutbox{due: rows(3)}
+	pub := &fakePublisher{}
+	r := &Relay{Store: outbox, Publisher: pub, Logger: quiet} // no Batch, no Interval
+	runInBackground(t, r.Run)
+
+	eventually(t, time.Second, func() bool { return pub.count() == 3 }, "relay with zero config did not publish")
+	time.Sleep(50 * time.Millisecond)
+	outbox.mu.Lock()
+	calls := outbox.calls
+	outbox.mu.Unlock()
+	if calls > 2 {
+		t.Fatalf("ClaimDue called %d times in 50ms: relay is busy-looping", calls)
+	}
+}
+
 type fakeSweeper struct {
-	calls     atomic.Int32
-	olderThan atomic.Int64
+	calls       atomic.Int32
+	olderThan   atomic.Int64
+	queuedCalls atomic.Int32
+	queuedAfter atomic.Int64
 }
 
 func (f *fakeSweeper) ResetStuck(_ context.Context, d time.Duration) (int64, error) {
@@ -179,15 +197,39 @@ func (f *fakeSweeper) ResetStuck(_ context.Context, d time.Duration) (int64, err
 	return 1, nil
 }
 
+func (f *fakeSweeper) ResetStaleQueued(_ context.Context, d time.Duration) (int64, error) {
+	f.queuedCalls.Add(1)
+	f.queuedAfter.Store(int64(d))
+	return 1, nil
+}
+
 func TestSweeperRunsImmediatelyAndOnInterval(t *testing.T) {
 	st := &fakeSweeper{}
-	s := &Sweeper{Store: st, Interval: 20 * time.Millisecond, StuckAfter: 2 * time.Minute, Logger: quiet}
+	s := &Sweeper{Store: st, Interval: 20 * time.Millisecond, StuckAfter: 2 * time.Minute, QueuedAfter: 10 * time.Minute, Logger: quiet}
 	runInBackground(t, s.Run)
 
 	eventually(t, time.Second, func() bool { return st.calls.Load() >= 1 }, "sweeper did not run on start")
 	eventually(t, time.Second, func() bool { return st.calls.Load() >= 3 }, "sweeper did not run on interval")
 	if got := time.Duration(st.olderThan.Load()); got != 2*time.Minute {
 		t.Errorf("olderThan = %v, want 2m", got)
+	}
+	eventually(t, time.Second, func() bool { return st.queuedCalls.Load() >= 3 }, "sweeper did not reset stale queued rows")
+	if got := time.Duration(st.queuedAfter.Load()); got != 10*time.Minute {
+		t.Errorf("queuedAfter = %v, want 10m", got)
+	}
+}
+
+func TestSweeperDefaults(t *testing.T) {
+	st := &fakeSweeper{}
+	s := &Sweeper{Store: st, Logger: quiet} // no Interval: must not panic
+	runInBackground(t, s.Run)
+
+	eventually(t, time.Second, func() bool { return st.queuedCalls.Load() >= 1 }, "sweeper did not run")
+	if got := time.Duration(st.olderThan.Load()); got != DefaultStuckAfter {
+		t.Errorf("olderThan = %v, want %v", got, DefaultStuckAfter)
+	}
+	if got := time.Duration(st.queuedAfter.Load()); got != DefaultQueuedAfter {
+		t.Errorf("queuedAfter = %v, want %v", got, DefaultQueuedAfter)
 	}
 }
 
@@ -237,4 +279,89 @@ func TestRelayPublishesDueRows(t *testing.T) {
 		d, err := queue.Depth(ch, queue.Name(domain.ChannelSMS))
 		return err == nil && d == 1
 	}, "message not in notifications.sms")
+}
+
+// countingSender accepts every notification and counts sends per id.
+type countingSender struct {
+	mu    sync.Mutex
+	sends map[string]int
+}
+
+func (s *countingSender) Send(_ context.Context, key, _ string, _ provider.Request) (provider.Result, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sends[key]++
+	id := "pm-" + key
+	return provider.Result{StatusCode: 202, MessageID: &id}, nil
+}
+
+// TestRelayAndConsumerDeliverEveryNotification runs relay, consumer and
+// handler against real Postgres and RabbitMQ. It is the end-to-end
+// regression test for the race where a consumer received a message before
+// the relay committed its row as queued, skipped it, and left the row
+// stuck in queued: every row must reach sent, each sent exactly once.
+func TestRelayAndConsumerDeliverEveryNotification(t *testing.T) {
+	pool := testutil.Postgres(t)
+	conn := testutil.RabbitMQ(t)
+	ctx := context.Background()
+
+	ch, err := conn.Channel()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ch.Close() })
+	if err := queue.Setup(ch); err != nil {
+		t.Fatal(err)
+	}
+	purge := func() {
+		for _, c := range domain.Channels {
+			_, _ = ch.QueuePurge(queue.Name(c), false)
+		}
+	}
+	purge()
+	t.Cleanup(purge)
+
+	st := store.New(pool)
+	const total = 50
+	for range total {
+		n := sms()
+		n.NextAttemptAt = time.Now().Add(-time.Second)
+		if _, _, err := st.Create(ctx, n); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sender := &countingSender{sends: map[string]int{}}
+	h := &Handler{
+		Store: st, Sender: sender, DLQ: &fakeDLQ{}, Limiters: NewLimiters(1000),
+		Logger: quiet, Now: time.Now, Rand: func() float64 { return 0 }, RetryBase: time.Second,
+	}
+	runInBackground(t, func(ctx context.Context) error {
+		return queue.Consume(ctx, conn, domain.ChannelSMS, 20, h.Handle)
+	})
+
+	pub, err := queue.NewPublisher(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pub.Close() })
+	// Small batches: many claim/publish/consume interleavings.
+	r := &Relay{Store: st, Publisher: pub, Interval: 20 * time.Millisecond, Batch: 5, Logger: quiet}
+	runInBackground(t, r.Run)
+
+	eventually(t, 15*time.Second, func() bool {
+		counts, err := st.CountByStatus(ctx)
+		return err == nil && counts[domain.StatusSent] == total
+	}, "not every notification reached sent (rows stuck in queued?)")
+
+	sender.mu.Lock()
+	defer sender.mu.Unlock()
+	if len(sender.sends) != total {
+		t.Fatalf("provider saw %d distinct notifications, want %d", len(sender.sends), total)
+	}
+	for id, c := range sender.sends {
+		if c != 1 {
+			t.Errorf("notification %s sent %d times, want 1", id, c)
+		}
+	}
 }

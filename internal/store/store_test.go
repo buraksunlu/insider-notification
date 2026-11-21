@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -237,8 +238,8 @@ func TestClaimDue_RespectsScheduleAndPriority(t *testing.T) {
 	}
 
 	var published []domain.Notification
-	count, err := s.ClaimDue(ctx, 10, func(ns []domain.Notification) error {
-		published = append(published, ns...)
+	count, err := s.ClaimDue(ctx, 10, func(n domain.Notification) error {
+		published = append(published, n)
 		return nil
 	})
 	if err != nil || count != 2 {
@@ -261,12 +262,79 @@ func TestClaimDue_RollsBackOnPublishError(t *testing.T) {
 	s, _ := setup(t)
 	n := mustCreate(t, s, newSMS("x"))
 
-	_, err := s.ClaimDue(ctx, 10, func([]domain.Notification) error { return errors.New("broker down") })
+	_, err := s.ClaimDue(ctx, 10, func(domain.Notification) error { return errors.New("broker down") })
 	if err == nil {
 		t.Fatal("expected publish error")
 	}
 	if got, _ := s.Get(ctx, n.ID); got.Status != domain.StatusPending {
 		t.Fatalf("status = %s, want pending after failed publish", got.Status)
+	}
+}
+
+// TestClaimDue_CommitsBeforePublish is the regression test for the
+// relay/consumer race: a consumer may receive the message the moment it is
+// published, so the row must already be committed as queued by then.
+func TestClaimDue_CommitsBeforePublish(t *testing.T) {
+	s, _ := setup(t)
+	n := mustCreate(t, s, newSMS("x"))
+
+	var started bool
+	_, err := s.ClaimDue(ctx, 10, func(m domain.Notification) error {
+		// What a consumer does on receipt, on another connection.
+		_, ok, err := s.StartProcessing(ctx, m.ID)
+		started = ok
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !started {
+		t.Fatal("consumer could not claim a published row: it was not committed as queued before publish")
+	}
+	if got, _ := s.Get(ctx, n.ID); got.Status != domain.StatusProcessing {
+		t.Fatalf("status = %s, want processing", got.Status)
+	}
+}
+
+func TestClaimDue_PublishErrorReleasesOnlyUnpublished(t *testing.T) {
+	s, _ := setup(t)
+	var ids []uuid.UUID
+	for i := range 3 {
+		ids = append(ids, mustCreate(t, s, newSMS(fmt.Sprint(i))).ID)
+	}
+
+	calls := 0
+	count, err := s.ClaimDue(ctx, 10, func(domain.Notification) error {
+		calls++
+		if calls == 2 {
+			return errors.New("broker down")
+		}
+		return nil
+	})
+	if err == nil || count != 1 {
+		t.Fatalf("claim: count=%d err=%v, want 1 published and an error", count, err)
+	}
+	statuses := map[domain.Status]int{}
+	for _, id := range ids {
+		got, _ := s.Get(ctx, id)
+		statuses[got.Status]++
+	}
+	if statuses[domain.StatusQueued] != 1 || statuses[domain.StatusPending] != 2 {
+		t.Fatalf("statuses = %v, want 1 queued (published) and 2 pending", statuses)
+	}
+}
+
+func TestMarkSent_OverridesCancelled(t *testing.T) {
+	s, pool := setup(t)
+	n := mustCreate(t, s, newSMS("x"))
+	// The sweeper reset a stalled delivery, then the user cancelled it; the
+	// stalled worker finally gets a 2xx. The message was delivered.
+	setStatus(t, pool, n.ID, domain.StatusCancelled)
+	if err := s.MarkSent(ctx, n.ID, strp("prov-late"), time.Now()); err != nil {
+		t.Fatalf("MarkSent over cancelled: %v", err)
+	}
+	if got, _ := s.Get(ctx, n.ID); got.Status != domain.StatusSent {
+		t.Fatalf("status = %s, want sent", got.Status)
 	}
 }
 
@@ -370,6 +438,39 @@ func TestList_BadCursor(t *testing.T) {
 		if _, _, err := s.List(ctx, store.ListFilter{Page: store.Page{Cursor: c}}); !errors.Is(err, store.ErrBadCursor) {
 			t.Fatalf("cursor %q: want ErrBadCursor, got %v", c, err)
 		}
+	}
+}
+
+func TestResetStaleQueued(t *testing.T) {
+	s, pool := setup(t)
+	stale := mustCreate(t, s, newSMS("stale"))
+	fresh := mustCreate(t, s, newSMS("fresh"))
+	if _, err := pool.Exec(ctx, `UPDATE notifications SET status='queued', updated_at = now() - interval '15 minutes' WHERE id=$1`, stale.ID); err != nil {
+		t.Fatal(err)
+	}
+	setStatus(t, pool, fresh.ID, domain.StatusQueued)
+
+	n, err := s.ResetStaleQueued(ctx, 10*time.Minute)
+	if err != nil || n != 1 {
+		t.Fatalf("reset: n=%d err=%v", n, err)
+	}
+	if got, _ := s.Get(ctx, stale.ID); got.Status != domain.StatusPending {
+		t.Fatalf("stale row status = %s, want pending", got.Status)
+	}
+	if got, _ := s.Get(ctx, fresh.ID); got.Status != domain.StatusQueued {
+		t.Fatalf("fresh row status = %s, want queued", got.Status)
+	}
+}
+
+func TestClaimDue_UsesPriorityIndex(t *testing.T) {
+	_, pool := setup(t)
+	var def string
+	err := pool.QueryRow(ctx, `SELECT indexdef FROM pg_indexes WHERE indexname = 'notifications_due_idx'`).Scan(&def)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "(priority_rank DESC, next_attempt_at)"; !strings.Contains(def, want) {
+		t.Fatalf("notifications_due_idx = %q, want it on %s", def, want)
 	}
 }
 
