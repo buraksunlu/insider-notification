@@ -208,3 +208,27 @@ func TestSendOmitsEmptyCorrelationID(t *testing.T) {
 		t.Error("X-Correlation-ID sent although empty")
 	}
 }
+
+// Go's client turns a POST into a body-less GET on 301/302/303; a 200 from
+// the redirect target would then count an undelivered message as sent.
+func TestSendDoesNotFollowRedirects(t *testing.T) {
+	var targetHit bool
+	target := newServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		targetHit = true
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	})
+
+	res, err := provider.NewClient(srv.URL, time.Second).Send(context.Background(), "idem-1", "", smsReq)
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if res.StatusCode != http.StatusFound {
+		t.Errorf("StatusCode = %d, want 302 (redirect not followed)", res.StatusCode)
+	}
+	if targetHit {
+		t.Error("redirect target was called")
+	}
+}

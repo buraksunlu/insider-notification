@@ -48,12 +48,18 @@ type Client struct {
 
 // NewClient returns a client that gives each Send at most timeout,
 // covering connect, headers and body.
+//
+// Redirects are not followed: on 301/302/303 Go would resend the POST as a
+// GET without a body, and a 2xx from the target would record an undelivered
+// notification as sent. The 3xx is returned and classified as permanent.
 func NewClient(url string, timeout time.Duration) *Client {
 	return &Client{
 		url:     url,
 		timeout: timeout,
-		http:    &http.Client{},
-		now:     time.Now,
+		http: &http.Client{
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
+		now: time.Now,
 	}
 }
 
