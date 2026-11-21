@@ -35,10 +35,10 @@ services:
       retries: 30
 
   migrate:
-    image: migrate/migrate:v4.18.1
+    build:
+      context: .
+      target: migrate
     command: ["-path", "/migrations", "-database", "postgres://notify:notify@postgres:5432/notify?sslmode=disable", "up"]
-    volumes:
-      - ./migrations:/migrations:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -57,6 +57,7 @@ services:
       migrate:
         condition: service_completed_successfully
     restart: unless-stopped
+    stop_grace_period: 20s # drains in-flight requests for up to 15s
 
   worker:
     build:
@@ -79,6 +80,9 @@ services:
         condition: service_started
     # The worker exits when it loses RabbitMQ; restarting is the recovery.
     restart: unless-stopped
+    # In-flight deliveries finish on SIGTERM: provider timeout (5s) plus the
+    # outcome write (up to 30s). A SIGKILL before that could resend a message.
+    stop_grace_period: 45s
 
   mockprovider:
     build:
