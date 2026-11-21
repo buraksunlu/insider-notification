@@ -1,3 +1,11 @@
+# docker compose up --build
+#   API + Swagger UI  http://localhost:8080/docs
+#   worker metrics    http://localhost:9091/metrics
+#   RabbitMQ UI       http://localhost:15672 (guest/guest)
+# PROVIDER_URL defaults to the bundled mock provider; point it at a
+# webhook.site URL to deliver there: PROVIDER_URL=https://webhook.site/<uuid> docker compose up
+x-db-url: &db-url postgres://notify:notify@postgres:5432/notify?sslmode=disable
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -35,6 +43,53 @@ services:
       postgres:
         condition: service_healthy
     restart: "no"
+
+  api:
+    build:
+      context: .
+      args: {CMD: api}
+    environment:
+      DATABASE_URL: *db-url
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      args: {CMD: worker}
+    environment:
+      DATABASE_URL: *db-url
+      AMQP_URL: amqp://guest:guest@rabbitmq:5672/
+      PROVIDER_URL: ${PROVIDER_URL:-http://mockprovider:8080}
+      RETRY_BASE: ${RETRY_BASE:-2s}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "9091:9091"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+      mockprovider:
+        condition: service_started
+    # The worker exits when it loses RabbitMQ; restarting is the recovery.
+    restart: unless-stopped
+
+  mockprovider:
+    build:
+      context: .
+      args: {CMD: mockprovider}
+    environment:
+      FAIL_RATE: ${MOCK_FAIL_RATE:-0}
+      LATENCY_MS: ${MOCK_LATENCY_MS:-50}
+    ports:
+      - "8090:8080"
+    restart: unless-stopped
 
 volumes:
   pgdata:
