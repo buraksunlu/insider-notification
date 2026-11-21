@@ -10,13 +10,19 @@ import (
 
 // RelayStore is the outbox side of the store.
 type RelayStore interface {
-	ClaimDue(ctx context.Context, limit int, publish func([]domain.Notification) error) (int, error)
+	ClaimDue(ctx context.Context, limit int, publish func(domain.Notification) error) (int, error)
 }
 
 // Publisher publishes a notification to its channel queue.
 type Publisher interface {
 	Publish(ctx context.Context, n domain.Notification) error
 }
+
+// Relay defaults, used when Interval or Batch is not set.
+const (
+	DefaultRelayInterval = time.Second
+	DefaultRelayBatch    = 500
+)
 
 // Relay moves due notifications from the database outbox to RabbitMQ.
 // It wakes on a LISTEN signal (new inserts) and on every Interval (retries
@@ -25,15 +31,23 @@ type Relay struct {
 	Store     RelayStore
 	Publisher Publisher
 	// Listen returns a channel signalled on new inserts; nil means poll only.
-	Listen   func(ctx context.Context) <-chan struct{}
+	Listen func(ctx context.Context) <-chan struct{}
+	// Interval is the poll period; zero means DefaultRelayInterval.
 	Interval time.Duration
-	Batch    int
-	Logger   *slog.Logger
+	// Batch is the most rows claimed per transaction; zero means DefaultRelayBatch.
+	Batch  int
+	Logger *slog.Logger
 }
 
 // Run relays until ctx is cancelled and then returns nil. Errors are logged
-// and retried on the next tick: unpublished rows simply stay pending.
+// and retried on the next tick: unpublished rows go back to pending.
 func (r *Relay) Run(ctx context.Context) error {
+	if r.Interval <= 0 {
+		r.Interval = DefaultRelayInterval
+	}
+	if r.Batch <= 0 {
+		r.Batch = DefaultRelayBatch
+	}
 	var wake <-chan struct{}
 	if r.Listen != nil {
 		wake = r.Listen(ctx)
@@ -59,13 +73,8 @@ func (r *Relay) Run(ctx context.Context) error {
 // published without waiting for the next tick.
 func (r *Relay) drain(ctx context.Context) {
 	for ctx.Err() == nil {
-		n, err := r.Store.ClaimDue(ctx, r.Batch, func(due []domain.Notification) error {
-			for _, item := range due {
-				if err := r.Publisher.Publish(ctx, item); err != nil {
-					return err
-				}
-			}
-			return nil
+		n, err := r.Store.ClaimDue(ctx, r.Batch, func(item domain.Notification) error {
+			return r.Publisher.Publish(ctx, item)
 		})
 		if err != nil {
 			if ctx.Err() == nil {

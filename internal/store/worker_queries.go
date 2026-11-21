@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -11,40 +12,61 @@ import (
 	"github.com/buraksunlu/insider-notification/internal/domain"
 )
 
-// ClaimDue locks up to limit due pending notifications (highest priority
-// first), hands them to publish and marks them queued. If publish fails the
-// transaction rolls back and the rows stay pending for the next tick.
+// ClaimDue marks up to limit due pending notifications (highest priority
+// first) as queued, commits, and only then hands each to publish. The
+// commit must come first: a consumer can receive a message the moment it is
+// published, and it only claims rows that are already queued.
+//
+// If publish fails, the rows not yet published go back to pending and the
+// error is returned with the count published so far. A row whose release
+// also fails stays queued until the sweeper's stale-queued reset recovers it.
 // SKIP LOCKED lets several relays run without claiming the same rows.
-func (s *Store) ClaimDue(ctx context.Context, limit int, publish func([]domain.Notification) error) (int, error) {
-	var claimed int
+func (s *Store) ClaimDue(ctx context.Context, limit int, publish func(domain.Notification) error) (int, error) {
+	var due []domain.Notification
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `SELECT `+columns+` FROM notifications
-			WHERE status = 'pending' AND next_attempt_at <= now()
-			ORDER BY priority_rank DESC, next_attempt_at
-			LIMIT $1
-			FOR UPDATE SKIP LOCKED`, limit)
+		rows, err := tx.Query(ctx, `UPDATE notifications SET status = 'queued', updated_at = now()
+			WHERE id IN (
+				SELECT id FROM notifications
+				WHERE status = 'pending' AND next_attempt_at <= now()
+				ORDER BY priority_rank DESC, next_attempt_at
+				LIMIT $1
+				FOR UPDATE SKIP LOCKED)
+			RETURNING `+columns, limit)
 		if err != nil {
 			return err
 		}
-		due, err := scanAll(rows)
-		if err != nil || len(due) == 0 {
-			return err
-		}
-		if err := publish(due); err != nil {
-			return err
-		}
-		ids := make([]uuid.UUID, len(due))
-		for i, n := range due {
-			ids[i] = n.ID
-		}
-		if _, err := tx.Exec(ctx, `UPDATE notifications SET status = 'queued', updated_at = now()
-			WHERE id = ANY($1)`, ids); err != nil {
-			return err
-		}
-		claimed = len(due)
-		return nil
+		due, err = scanAll(rows)
+		return err
 	})
-	return claimed, err
+	if err != nil {
+		return 0, err
+	}
+	// UPDATE ... RETURNING does not keep the subquery's order.
+	sort.SliceStable(due, func(i, j int) bool {
+		if due[i].Priority.AMQP() != due[j].Priority.AMQP() {
+			return due[i].Priority.AMQP() > due[j].Priority.AMQP()
+		}
+		return due[i].NextAttemptAt.Before(due[j].NextAttemptAt)
+	})
+
+	for i, n := range due {
+		if err := publish(n); err != nil {
+			s.release(ctx, due[i:])
+			return i, err
+		}
+	}
+	return len(due), nil
+}
+
+// release returns claimed but unpublished rows to pending. It is best
+// effort: on failure the stale-queued sweep picks the rows up later.
+func (s *Store) release(ctx context.Context, ns []domain.Notification) {
+	ids := make([]uuid.UUID, len(ns))
+	for i, n := range ns {
+		ids[i] = n.ID
+	}
+	_, _ = s.pool.Exec(context.WithoutCancel(ctx), `UPDATE notifications SET status = 'pending', updated_at = now()
+		WHERE id = ANY($1) AND status = 'queued'`, ids)
 }
 
 // StartProcessing moves a queued notification to processing and counts the
@@ -62,11 +84,13 @@ func (s *Store) StartProcessing(ctx context.Context, id uuid.UUID) (domain.Notif
 }
 
 // MarkSent records a successful delivery. A success is kept even when the
-// sweeper has meanwhile reset the row, so a delivered message is not resent.
+// sweeper has meanwhile reset the row (so a delivered message is not resent)
+// and even when the reset row was then cancelled: the provider accepted the
+// message, so sent is the truthful status.
 func (s *Store) MarkSent(ctx context.Context, id uuid.UUID, providerMsgID *string, at time.Time) error {
 	return s.transition(ctx, `UPDATE notifications
 		SET status = 'sent', provider_message_id = $2, sent_at = $3, last_error = NULL, updated_at = now()
-		WHERE id = $1 AND status IN ('processing', 'pending', 'queued')`, id, providerMsgID, at)
+		WHERE id = $1 AND status IN ('processing', 'pending', 'queued', 'cancelled')`, id, providerMsgID, at)
 }
 
 // ScheduleRetry puts a processing notification back to pending, due at next.
@@ -111,6 +135,18 @@ func (s *Store) ResetStuck(ctx context.Context, olderThan time.Duration) (int64,
 	tag, err := s.pool.Exec(ctx, `UPDATE notifications
 		SET status = 'pending', next_attempt_at = now(), updated_at = now()
 		WHERE status = 'processing' AND updated_at < now() - make_interval(secs => $1)`, olderThan.Seconds())
+	return tag.RowsAffected(), err
+}
+
+// ResetStaleQueued returns notifications queued for longer than olderThan
+// to pending so the relay publishes them again. It recovers rows whose
+// message never reached a queue (dropped, purged, or a release that failed
+// after a publish error). If the old message does turn up later, it is
+// skipped: StartProcessing only claims a row once.
+func (s *Store) ResetStaleQueued(ctx context.Context, olderThan time.Duration) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `UPDATE notifications
+		SET status = 'pending', updated_at = now()
+		WHERE status = 'queued' AND updated_at < now() - make_interval(secs => $1)`, olderThan.Seconds())
 	return tag.RowsAffected(), err
 }
 

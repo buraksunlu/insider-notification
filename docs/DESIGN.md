@@ -46,7 +46,7 @@ Kafka was excluded: no native priority, heavy for the scope.
                          ┌──────────────────── worker process ─────────────────────┐
                          │ relay ──publish(priority)──▶ RabbitMQ  ──▶ consumers    │
                          │ (outbox + scheduler + retry scheduler)     (per channel) │
-                         │ sweeper (stuck "processing" → pending)        │          │
+                         │ sweeper (stuck "processing"/"queued" → pending)│         │
                          └───────────────────────────────────────────────│──────────┘
                                                                          ▼
                                                      rate limiter (100/s/channel)
@@ -60,7 +60,11 @@ Two binaries from one module: `cmd/api`, `cmd/worker`.
 The API never publishes to RabbitMQ directly. It only inserts rows (`status=pending`) in one
 transaction and fires `NOTIFY`. The worker's **relay** loop claims due rows
 (`status='pending' AND next_attempt_at <= now()`, `FOR UPDATE SKIP LOCKED`, batch of 500),
-publishes them with publisher confirms, then marks them `queued`.
+marks them `queued` and **commits**, then publishes them with publisher confirms. The commit
+comes first because a consumer can receive a message the instant it is published and only
+claims rows that are already `queued`; publishing inside the transaction left such rows stuck
+in `queued`. If a publish fails, the rows not yet published go back to `pending`; if that
+release fails too, the sweeper's stale-`queued` reset recovers them.
 Woken by `LISTEN/NOTIFY`, with a 1 s polling fallback. A full batch is followed immediately by
 the next one. The LISTEN connection reconnects after 1 s on loss; polling covers the gap.
 
@@ -93,8 +97,9 @@ One path therefore covers: crash-safe enqueue (transactional outbox), **schedule
 Enumerations are `text` + `CHECK` rather than Postgres `ENUM` types, so adding a value later is a
 plain migration (`ALTER TYPE … ADD VALUE` cannot run inside a transaction on older versions).
 
-Indexes: partial `(next_attempt_at) WHERE status='pending'` for the relay; partial
-`(updated_at) WHERE status='processing'` for the sweeper; `(created_at, id)` for keyset listing;
+Indexes: partial `(priority_rank DESC, next_attempt_at) WHERE status='pending'` for the relay
+(matches its `ORDER BY`, so a large backlog is not sorted on every claim); partial
+`(updated_at) WHERE status='processing'` and `(updated_at) WHERE status='queued'` for the sweeper; `(created_at, id)` for keyset listing;
 `(batch_id)`; `(channel, status, created_at)` for filters.
 
 `batches` (id, total, created_at) · `delivery_attempts` (notification_id, attempt, http_status,
@@ -130,7 +135,8 @@ pending | queued ──cancel──▶ cancelled
 4. **Classify**:
    - 2xx → `sent`, store `messageId`.
    - 408, 429, 5xx, timeout, network error, cancellation on shutdown → retryable.
-   - other 4xx and leftover 3xx (redirects are already followed by the client) → permanent.
+   - other 4xx and 3xx → permanent. Redirects are not followed: Go would resend the POST as a
+     body-less GET and a 2xx from the target would count an undelivered message as sent.
 5. Retryable and `attempts < max_attempts` → `pending`, `next_attempt_at = now + full-jitter
    backoff` (base 2 s, ×2 per attempt, cap 5 min; honour `Retry-After` on 429, capped at 5 min).
    With 8 attempts the worst-case retry window is ≈ 4 min (2+4+…+128 s), long enough to ride
@@ -140,13 +146,18 @@ pending | queued ──cancel──▶ cancelled
 6. Write a `delivery_attempts` row (best effort: an audit failure is logged and does not change
    the outcome), then **ack**.
 
-The final state write (`sent` / retry / `failed`) is retried 3 times (100, 200 ms pauses) before
-the message is requeued, so a short database blip does not turn a delivered message into a
-duplicate send after the sweeper resets it. `ErrStateConflict` (row already moved on) is not
-retried. The rate limiter runs after the claim guard, so skipped messages spend no tokens.
+The final state write (`sent` / retry / `failed`) is retried with doubling pauses (100 ms up to
+2 s) for up to 30 s before the message is requeued, on a context detached from shutdown. Giving
+up early would be worse than waiting: the redelivered message is skipped (the row is
+`processing`), the sweeper resets the row, and a delivered message is sent again.
+`ErrStateConflict` (row already moved on) is not retried. `sent` also overrides `cancelled`: if
+the sweeper reset a stalled delivery and the user then cancelled it, a late 2xx means the
+message did reach the provider. The rate limiter runs after the claim guard, so skipped messages spend no tokens.
 
 Crash recovery: an unacked message is redelivered, but its row is `processing`, so the guard
-would skip it. The **sweeper** resets rows stuck in `processing` for > 2 min back to `pending`.
+would skip it. The **sweeper** resets rows stuck in `processing` for > 2 min back to `pending`,
+and rows `queued` for > 10 min (their message never reached a queue: dropped, purged, or a
+failed release). If the old message still turns up, the claim guard skips it.
 Delivery is therefore at-least-once toward the provider in the crash window, mitigated by the
 `Idempotency-Key` header; documented in README.
 
