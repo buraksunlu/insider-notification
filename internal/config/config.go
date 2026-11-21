@@ -26,7 +26,8 @@ type Config struct {
 }
 
 // Load reads the configuration from the environment, applying defaults
-// for optional values and failing when a required value is missing.
+// for optional values. DATABASE_URL is required by both binaries; the
+// worker additionally calls ValidateWorker.
 func Load() (Config, error) {
 	cfg := Config{
 		DatabaseURL: os.Getenv("DATABASE_URL"),
@@ -38,14 +39,8 @@ func Load() (Config, error) {
 	}
 
 	var errs []error
-	for name, val := range map[string]string{
-		"DATABASE_URL": cfg.DatabaseURL,
-		"AMQP_URL":     cfg.AMQPURL,
-		"PROVIDER_URL": cfg.ProviderURL,
-	} {
-		if val == "" {
-			errs = append(errs, fmt.Errorf("%s is required", name))
-		}
+	if cfg.DatabaseURL == "" {
+		errs = append(errs, errors.New("DATABASE_URL is required"))
 	}
 
 	base, err := time.ParseDuration(getenv("RETRY_BASE", "2s"))
@@ -68,4 +63,16 @@ func getenv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// ValidateWorker checks the settings only the worker needs.
+func (c Config) ValidateWorker() error {
+	var errs []error
+	if c.AMQPURL == "" {
+		errs = append(errs, errors.New("AMQP_URL is required"))
+	}
+	if c.ProviderURL == "" {
+		errs = append(errs, errors.New("PROVIDER_URL is required"))
+	}
+	return errors.Join(errs...)
 }
