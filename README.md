@@ -170,6 +170,8 @@ Base path `/api/v1`. The full contract with examples is at
 | `GET /notifications` | List with `status`, `channel`, `from`, `to` filters and cursor pagination. |
 | `GET /batches/{id}` | Counts per status plus the batch's notifications. |
 | `POST /batches/{id}/cancel` | Cancel every pending or queued item of a batch. |
+| `POST /templates` | Create a reusable body with `{{variable}}` placeholders. |
+| `GET /templates`, `GET /templates/{id}` | List or read templates, with their placeholder names. |
 
 Validation rules:
 
@@ -215,6 +217,33 @@ curl -s -X POST $API/notifications/<id>/cancel
 curl -s "$API/notifications?channel=sms&status=failed&from=2026-11-21T00:00:00Z&limit=50"
 curl -s "$API/notifications?channel=sms&status=failed&limit=50&cursor=<next_cursor>"
 ```
+
+### Templates
+
+A template is a reusable body with `{{variable}}` placeholders. A
+notification gives either `content` or `template_id` with `variables`:
+
+```sh
+curl -s -X POST $API/templates -H 'Content-Type: application/json' \
+  -d '{"name":"order-shipped","channel":"sms","body":"Merhaba {{name}}, siparişin {{order}} kargoda"}'
+# → 201 {"id":"<template_id>","variables":["name","order"],…}
+
+curl -s -X POST $API/notifications -H 'Content-Type: application/json' \
+  -d '{"channel":"sms","recipient":"+905551234567","template_id":"<template_id>","variables":{"name":"Şule","order":"A-1001"}}'
+# → 202 {"content":"Merhaba Şule, siparişin A-1001 kargoda","template_id":"<template_id>",…}
+```
+
+The rendered text is stored on the notification and checked against the
+channel's limits like any other content.
+
+- A missing variable is a 422 that names it.
+- Extra variables are ignored, so a template can drop a placeholder without
+  breaking clients.
+- The template's channel must match the notification's channel.
+- Templates are immutable: `template_id` on a notification always names the
+  body it was rendered from.
+- Batch items can use templates too. A batch of 1000 items that share one
+  template reads it once.
 
 ### Trying failures with the mock provider
 
@@ -311,6 +340,7 @@ make down   # stops the stack and removes its volumes
   - a cancelled scheduled notification is never sent
   - batch summary
   - idempotent replay
+  - a notification rendered from a template
 
 CI runs lint, the tests and the end-to-end suite on every push and pull request.
 
@@ -332,5 +362,6 @@ CI runs lint, the tests and the end-to-end suite on every push and pull request.
   downtime.
 - **Retention.** Delivered rows and attempts are kept forever. A production
   setup would partition `notifications` by time and archive old partitions.
-- **Not built:** templates, WebSocket status updates and distributed tracing.
+- **Not built:** WebSocket status updates, distributed tracing, and template
+  versioning (templates are immutable; a new version is a new template).
   The correlation id already gives a trace key to build on.

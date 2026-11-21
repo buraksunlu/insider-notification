@@ -108,7 +108,9 @@ Indexes: partial `(priority_rank DESC, next_attempt_at) WHERE status='pending'` 
 
 `batches` (id, total, created_at) · `delivery_attempts` (notification_id, attempt, http_status,
 error, latency_ms, created_at) — attempt history for debugging.
-`templates` (bonus, own migration): id, name UNIQUE, channel, body with `{{var}}` placeholders.
+`templates` (migration 000003): id, name UNIQUE, channel, body with `{{var}}` placeholders,
+created_at. Immutable (no update or delete), so `notifications.template_id` (nullable FK) always
+names the body the stored, already rendered `content` came from.
 
 ### State machine
 ```
@@ -177,7 +179,7 @@ Graceful shutdown: stop consuming, finish in-flight, close channels (context + `
 | `POST /notifications/{id}/cancel` | Only `pending`/`queued` → 200; otherwise 409. `POST`, not `DELETE`: the record is kept. |
 | `POST /batches/{id}/cancel` | Cancels every `pending`/`queued` item of the batch → 200 `{batch_id, cancelled}`; unknown batch → 404. |
 | `GET /notifications` | Filters `status, channel, from, to` (RFC 3339, inclusive); keyset pagination `limit` (1–100, default 20) + opaque `cursor`. Response `{data: [...], next_cursor}`; bad parameters → 400. |
-| `POST /templates`, `GET /templates/{id}` | Bonus. |
+| `POST /templates`, `GET /templates`, `GET /templates/{id}` | Create (201; duplicate name → 409) and read templates; responses list the placeholder names. A notification (single or batch item) gives either `content` or `template_id` + `variables`, never both. The template is rendered first and the result validated like any content. Missing variable → 422 naming it; extra variables are ignored; template channel ≠ notification channel → 422; unknown template → 422. A batch reads each template once. |
 | `GET /healthz` | Liveness. |
 | `GET /readyz` | DB reachable (the API does not talk to RabbitMQ). |
 | `GET /metrics` | Prometheus. |
