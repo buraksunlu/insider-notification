@@ -514,3 +514,32 @@ func TestBatch_TrimmedKeysDuplicateInBatch(t *testing.T) {
 		t.Fatalf("code = %d body %s, want 422 duplicate key on item 1", r.code, r.raw)
 	}
 }
+
+func TestDocsServeSpecAndSwaggerUI(t *testing.T) {
+	spec := []byte("openapi: 3.0.3\ninfo: {title: test, version: '1'}\n")
+	handler := api.NewRouter(api.Deps{
+		Store: newFakeStore(), Logger: observability.NewLogger(io.Discard, "error"), OpenAPISpec: spec,
+	})
+	get := func(path string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest("GET", path, nil))
+		return rec
+	}
+
+	rec := get("/openapi.yaml")
+	if rec.Code != http.StatusOK || rec.Body.String() != string(spec) || !strings.Contains(rec.Header().Get("Content-Type"), "yaml") {
+		t.Fatalf("/openapi.yaml: code %d type %q body %q", rec.Code, rec.Header().Get("Content-Type"), rec.Body.String())
+	}
+	rec = get("/docs")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Header().Get("Content-Type"), "text/html") ||
+		!strings.Contains(rec.Body.String(), "swagger-ui") || !strings.Contains(rec.Body.String(), "/openapi.yaml") {
+		t.Fatalf("/docs: code %d type %q", rec.Code, rec.Header().Get("Content-Type"))
+	}
+}
+
+func TestDocsAbsentWithoutSpec(t *testing.T) {
+	h := newHarness(t)
+	if r := h.do(t, "GET", "/docs", ""); r.code != http.StatusNotFound {
+		t.Fatalf("/docs without a spec: code %d, want 404", r.code)
+	}
+}
