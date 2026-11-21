@@ -64,7 +64,10 @@ is lost, since every row lives in Postgres and the sweeper recovers rows left `q
 The API never publishes to RabbitMQ directly. It only inserts rows (`status=pending`) in one
 transaction and fires `NOTIFY`. The worker's **relay** loop claims due rows
 (`status='pending' AND next_attempt_at <= now()`, `FOR UPDATE SKIP LOCKED`, batch of 500),
-marks them `queued` and **commits**, then publishes them with publisher confirms. The commit
+marks them `queued` and **commits**, then publishes them with publisher confirms. Claims are per
+channel and capped: at most 10 000 rows per channel may be `queued` (≈ 100 s of work at 100 msg/s),
+so a backlog stays in Postgres and no message waits in RabbitMQ long enough for the stale-`queued`
+reset (10 min) to mistake it for lost and publish it again. The commit
 comes first because a consumer can receive a message the instant it is published and only
 claims rows that are already `queued`; publishing inside the transaction left such rows stuck
 in `queued`. If a publish fails, the rows not yet published go back to `pending`; if that
@@ -161,7 +164,8 @@ the sweeper reset a stalled delivery and the user then cancelled it, a late 2xx 
 message did reach the provider. The rate limiter runs after the claim guard, so skipped messages spend no tokens.
 
 Crash recovery: an unacked message is redelivered, but its row is `processing`, so the guard
-would skip it. The **sweeper** resets rows stuck in `processing` for > 2 min back to `pending`,
+would skip it. The **sweeper** resets rows stuck in `processing` for > 2 min back to `pending`
+(or to `failed` when that was the last attempt, so `attempts` never exceeds `max_attempts`),
 and rows `queued` for > 10 min (their message never reached a queue: dropped, purged, or a
 failed release). If the old message still turns up, the claim guard skips it.
 Delivery is therefore at-least-once toward the provider in the crash window, mitigated by the
@@ -230,7 +234,9 @@ migrations/   api/openapi.yaml (embedded, served at /openapi.yaml)   Dockerfile 
 ```
 
 ## 10. Running and testing
-- `docker compose up`: postgres, rabbitmq (management UI), `migrate` one-shot, api (Swagger UI at
+- `docker compose up`: postgres, rabbitmq (management UI), `migrate` one-shot (migrations baked
+  into its image, not bind-mounted, so the stack starts even where the checkout is invisible to
+  the Docker daemon, e.g. Colima with the repo outside the home folder), api (Swagger UI at
   `/docs`, same origin so "Try it out" needs no CORS), worker, mockprovider.
 - `PROVIDER_URL` env. Defaults to the bundled `mockprovider`, because the webhook.site free tier
   limits request volume and its URLs expire; `PROVIDER_URL=https://webhook.site/<uuid> docker
