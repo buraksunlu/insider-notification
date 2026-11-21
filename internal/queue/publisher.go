@@ -23,22 +23,38 @@ const confirmTimeout = 5 * time.Second
 // Publisher publishes persistent messages and waits for the broker's
 // confirmation, so a nil error means the message is stored by RabbitMQ.
 // It is safe for concurrent use.
+//
+// The broker closes a channel on some errors (e.g. publishing to a missing
+// exchange); the publisher then opens a new one on the next publish. A
+// closed connection is not recovered here: the caller reconnects.
 type Publisher struct {
-	mu sync.Mutex
-	ch *amqp.Channel
+	conn *amqp.Connection
+	mu   sync.Mutex
+	ch   *amqp.Channel
 }
 
 // NewPublisher opens a channel in confirm mode on conn.
 func NewPublisher(conn *amqp.Connection) (*Publisher, error) {
-	ch, err := conn.Channel()
+	p := &Publisher{conn: conn}
+	if err := p.open(); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// open replaces the channel with a new one in confirm mode. Callers hold
+// p.mu, except NewPublisher, which owns p exclusively.
+func (p *Publisher) open() error {
+	ch, err := p.conn.Channel()
 	if err != nil {
-		return nil, fmt.Errorf("open channel: %w", err)
+		return fmt.Errorf("open channel: %w", err)
 	}
 	if err := ch.Confirm(false); err != nil {
 		_ = ch.Close()
-		return nil, fmt.Errorf("confirm mode: %w", err)
+		return fmt.Errorf("confirm mode: %w", err)
 	}
-	return &Publisher{ch: ch}, nil
+	p.ch = ch
+	return nil
 }
 
 // Publish sends n to its channel queue with n's priority.
@@ -110,6 +126,11 @@ func (p *Publisher) publish(ctx context.Context, exchange, key string, msg amqp.
 	// publishes sequentially anyway.
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.ch.IsClosed() {
+		if err := p.open(); err != nil {
+			return err
+		}
+	}
 	dc, err := p.ch.PublishWithDeferredConfirmWithContext(ctx, exchange, key, false, false, msg)
 	if err != nil {
 		return fmt.Errorf("publish to %s: %w", exchange, err)
@@ -125,4 +146,8 @@ func (p *Publisher) publish(ctx context.Context, exchange, key string, msg amqp.
 }
 
 // Close closes the publisher's channel.
-func (p *Publisher) Close() error { return p.ch.Close() }
+func (p *Publisher) Close() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.ch.Close()
+}
