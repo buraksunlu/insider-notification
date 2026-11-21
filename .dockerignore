@@ -1,0 +1,9 @@
+.git
+.github
+.superpowers
+bin
+docs
+CASE.md
+plan.md
+*.out
+coverage.*
