@@ -61,11 +61,17 @@ func ValidateTemplate(in CreateTemplateInput) error {
 	case utf8.RuneCountInString(in.Body) > maxTemplateRunes:
 		fields["body"] = fmt.Sprintf("must be at most %d characters", maxTemplateRunes)
 	default:
-		// Whatever is left after removing valid placeholders must not
-		// contain braces: those are typos such as {{name or {{first name}}.
+		// Whatever is left after removing valid placeholders is the fixed
+		// text. It must not contain braces (typos such as {{name or
+		// {{first name}}), and it alone must fit the channel, or no
+		// notification could ever be rendered from the template.
 		rest := placeholder.ReplaceAllString(in.Body, "")
-		if strings.Contains(rest, "{{") || strings.Contains(rest, "}}") {
+		limit, known := maxContentRunes[Channel(in.Channel)]
+		switch {
+		case strings.Contains(rest, "{{") || strings.Contains(rest, "}}"):
 			fields["body"] = "has an invalid placeholder; use {{name}} with letters, digits and _"
+		case known && utf8.RuneCountInString(rest) > limit:
+			fields["body"] = fmt.Sprintf("fixed text (without placeholders) must be at most %d characters for %s", limit, in.Channel)
 		}
 	}
 	if len(fields) > 0 {
