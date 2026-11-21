@@ -47,7 +47,7 @@ func Postgres(t *testing.T) *pgxpool.Pool {
 	}
 	t.Cleanup(pool.Close)
 
-	if _, err := pool.Exec(ctx, "TRUNCATE delivery_attempts, notifications, batches"); err != nil {
+	if _, err := pool.Exec(ctx, "TRUNCATE delivery_attempts, notifications, batches, templates"); err != nil {
 		t.Fatalf("truncate: %v", err)
 	}
 	return pool

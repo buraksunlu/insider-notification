@@ -45,13 +45,13 @@ func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
 
 const columns = `id, batch_id, idempotency_key, channel, recipient, content, priority, status,
 	attempts, max_attempts, next_attempt_at, scheduled_at, provider_message_id, last_error,
-	correlation_id, created_at, updated_at, sent_at`
+	correlation_id, created_at, updated_at, sent_at, template_id`
 
 func scan(row pgx.Row) (domain.Notification, error) {
 	var n domain.Notification
 	err := row.Scan(&n.ID, &n.BatchID, &n.IdempotencyKey, &n.Channel, &n.Recipient, &n.Content,
 		&n.Priority, &n.Status, &n.Attempts, &n.MaxAttempts, &n.NextAttemptAt, &n.ScheduledAt,
-		&n.ProviderMessageID, &n.LastError, &n.CorrelationID, &n.CreatedAt, &n.UpdatedAt, &n.SentAt)
+		&n.ProviderMessageID, &n.LastError, &n.CorrelationID, &n.CreatedAt, &n.UpdatedAt, &n.SentAt, &n.TemplateID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return n, ErrNotFound
 	}
