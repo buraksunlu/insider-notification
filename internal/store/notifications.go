@@ -16,15 +16,15 @@ import (
 )
 
 const insertSQL = `INSERT INTO notifications (id, batch_id, idempotency_key, channel, recipient, content,
-	priority, status, attempts, max_attempts, next_attempt_at, scheduled_at, correlation_id, created_at, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+	priority, status, attempts, max_attempts, next_attempt_at, scheduled_at, correlation_id, created_at, updated_at, template_id)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 ON CONFLICT (idempotency_key) DO NOTHING
 RETURNING ` + columns
 
 func insertArgs(n domain.Notification) []any {
 	return []any{n.ID, n.BatchID, n.IdempotencyKey, n.Channel, n.Recipient, n.Content, n.Priority,
 		n.Status, n.Attempts, n.MaxAttempts, n.NextAttemptAt, n.ScheduledAt, n.CorrelationID,
-		n.CreatedAt, n.UpdatedAt}
+		n.CreatedAt, n.UpdatedAt, n.TemplateID}
 }
 
 // Create stores a notification. When its idempotency key already exists the
@@ -138,8 +138,10 @@ func (s *Store) getByKey(ctx context.Context, q querier, key string) (domain.Not
 func samePayload(a, b domain.Notification) bool {
 	sameSchedule := (a.ScheduledAt == nil) == (b.ScheduledAt == nil) &&
 		(a.ScheduledAt == nil || a.ScheduledAt.Truncate(time.Microsecond).Equal(b.ScheduledAt.Truncate(time.Microsecond)))
+	sameTemplate := (a.TemplateID == nil) == (b.TemplateID == nil) &&
+		(a.TemplateID == nil || *a.TemplateID == *b.TemplateID)
 	return a.Channel == b.Channel && a.Recipient == b.Recipient && a.Content == b.Content &&
-		a.Priority == b.Priority && sameSchedule
+		a.Priority == b.Priority && sameSchedule && sameTemplate
 }
 
 // Cancel moves a pending or queued notification to cancelled.

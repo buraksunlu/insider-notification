@@ -597,3 +597,56 @@ func TestHasIdempotencyKey(t *testing.T) {
 		}
 	}
 }
+
+func newTemplate(name string) domain.Template {
+	return domain.NewTemplate(domain.CreateTemplateInput{Name: name, Channel: "sms", Body: "Hi {{name}}"}, past())
+}
+
+func TestTemplates_CreateGetList(t *testing.T) {
+	s, _ := setup(t)
+	b := newTemplate("b-welcome")
+	a := newTemplate("a-shipped")
+	for _, tpl := range []domain.Template{b, a} {
+		if err := s.CreateTemplate(ctx, tpl); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := s.GetTemplate(ctx, a.ID)
+	if err != nil || got.Name != "a-shipped" || got.Channel != domain.ChannelSMS || got.Body != "Hi {{name}}" {
+		t.Fatalf("GetTemplate = %+v, %v", got, err)
+	}
+	if _, err := s.GetTemplate(ctx, uuid.New()); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("unknown template: %v, want ErrNotFound", err)
+	}
+	list, err := s.ListTemplates(ctx)
+	if err != nil || len(list) != 2 || list[0].Name != "a-shipped" || list[1].Name != "b-welcome" {
+		t.Fatalf("ListTemplates = %+v, %v; want both, sorted by name", list, err)
+	}
+}
+
+func TestTemplates_NameIsUnique(t *testing.T) {
+	s, _ := setup(t)
+	if err := s.CreateTemplate(ctx, newTemplate("dup")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateTemplate(ctx, newTemplate("dup")); !errors.Is(err, store.ErrTemplateNameTaken) {
+		t.Fatalf("second create: %v, want ErrTemplateNameTaken", err)
+	}
+}
+
+func TestCreate_StoresTemplateID(t *testing.T) {
+	s, _ := setup(t)
+	tpl := newTemplate("for-notification")
+	if err := s.CreateTemplate(ctx, tpl); err != nil {
+		t.Fatal(err)
+	}
+	n := newSMS("Hi Ada")
+	n.TemplateID = &tpl.ID
+	mustCreate(t, s, n)
+
+	got, err := s.Get(ctx, n.ID)
+	if err != nil || got.TemplateID == nil || *got.TemplateID != tpl.ID {
+		t.Fatalf("template_id = %v (err %v), want %s", got.TemplateID, err, tpl.ID)
+	}
+}
