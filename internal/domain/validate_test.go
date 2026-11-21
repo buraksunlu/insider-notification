@@ -113,3 +113,29 @@ func TestPriorityAMQP(t *testing.T) {
 		}
 	}
 }
+
+func TestOnlyScheduledInPast(t *testing.T) {
+	now := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+	past := now.Add(-time.Second)
+	farAhead := now.Add(31 * 24 * time.Hour)
+	ok := CreateInput{Channel: "sms", Recipient: "+905551234567", Content: "x"}
+
+	inPast := ok
+	inPast.ScheduledAt = &past
+	if !OnlyScheduledInPast(Validate(inPast, now)) {
+		t.Error("past scheduled_at alone: want true")
+	}
+	both := inPast
+	both.Recipient = "bad"
+	if OnlyScheduledInPast(Validate(both, now)) {
+		t.Error("past scheduled_at plus another error: want false")
+	}
+	tooFar := ok
+	tooFar.ScheduledAt = &farAhead
+	if OnlyScheduledInPast(Validate(tooFar, now)) {
+		t.Error("scheduled_at too far ahead: want false")
+	}
+	if OnlyScheduledInPast(nil) {
+		t.Error("nil error: want false")
+	}
+}

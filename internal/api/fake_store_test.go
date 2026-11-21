@@ -150,6 +150,13 @@ func (f *fakeStore) List(_ context.Context, filter store.ListFilter) ([]domain.N
 	return out, "next-cursor", nil
 }
 
+func (f *fakeStore) HasIdempotencyKey(_ context.Context, key string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.byKey[key]
+	return ok, nil
+}
+
 func (f *fakeStore) put(n domain.Notification) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
