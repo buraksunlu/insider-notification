@@ -111,6 +111,10 @@ and only then publishes with publisher confirms. That means:
   when `next_attempt_at <= now()`.
 - Retries are scheduled in the database, not with TTL queues, so the delay can
   follow the backoff and `Retry-After` exactly, and a pending retry can be cancelled.
+- A backlog stays in PostgreSQL. The relay keeps at most 10 000 messages per
+  channel in RabbitMQ (about 100 s of work at 100 msg/s) and tops a channel up
+  as consumers drain it, so a burst of a million notifications neither floods
+  the broker nor waits long enough in a queue to look lost to the sweeper.
 
 ### Processing a message
 
@@ -142,10 +146,11 @@ highest priority first.
 |---|---|
 | Duplicate API request with the same `Idempotency-Key` | The stored notification is returned (200). A different payload gets 409. This also works after `scheduled_at` has passed. |
 | Cancel after the message is already in the queue | The claim guard skips it. It is never sent. |
-| Worker crashes mid-delivery | The message is redelivered but skipped (the row is `processing`). The sweeper resets rows stuck in `processing` for more than 2 minutes back to `pending`. |
+| Worker crashes mid-delivery | The message is redelivered but skipped (the row is `processing`). The sweeper resets rows stuck in `processing` for more than 2 minutes back to `pending`, or to `failed` if that was the last attempt. |
 | Message lost between relay and consumer | The sweeper resets rows `queued` for more than 10 minutes. |
 | Database blip after the provider answered | The outcome write is retried for up to 30 s rather than requeued. Requeueing would resend a delivered message. |
 | RabbitMQ restarts | The worker exits and Compose restarts it. Nothing is lost: every row is in PostgreSQL. |
+| `docker compose stop` during deliveries | In-flight deliveries finish and record their outcome; the worker's stop grace period (45 s) covers the provider timeout plus the outcome write. |
 
 Delivery is **at least once** toward the provider. The only duplicate window
 is a worker crash between the provider's answer and the state write. Every
@@ -234,7 +239,10 @@ curl -s -X POST $API/notifications -H 'Content-Type: application/json' \
 ```
 
 The rendered text is stored on the notification and checked against the
-channel's limits like any other content.
+channel's limits like any other content. Variable values may be strings,
+numbers or booleans; numbers keep their exact spelling (`{"code": 4821}`).
+A template whose fixed text alone exceeds its channel's limit is rejected
+when it is created.
 
 - A missing variable is a 422 that names it.
 - Extra variables are ignored, so a template can drop a placeholder without
@@ -360,6 +368,10 @@ CI runs lint, the tests and the end-to-end suite on every push and pull request.
 - **Connection loss restarts the worker** instead of reconnecting in-process.
   The code stays simple and nothing is lost, at the cost of a few seconds of
   downtime.
+- **Status gauges count the table.** `notifications_by_status` runs a
+  `GROUP BY status` every 5 s. That is fine for this scope, but with tens of
+  millions of rows it should come from a counter table updated in the same
+  transactions, or count only the active statuses through their partial indexes.
 - **Retention.** Delivered rows and attempts are kept forever. A production
   setup would partition `notifications` by time and archive old partitions.
 - **Not built:** WebSocket status updates, distributed tracing, and template
